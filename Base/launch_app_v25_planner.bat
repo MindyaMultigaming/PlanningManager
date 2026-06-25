@@ -1,7 +1,4 @@
 @echo off
-cd /d "%USERPROFILE%\Downloads"
-
-py -m pip install ttkbootstrap tkcalendar
+cd /d "%~dp0"
 py app_v25_planner.py
-
 pause

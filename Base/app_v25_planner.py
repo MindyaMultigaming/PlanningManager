@@ -1,23 +1,11 @@
-# app_v25_planner.py
 """
-Planificateur multi-employés v25
---------------------------------
-Version ergonomique basée sur app_v24.py.
+Planning Manager - desktop app.
 
-Objectifs de cette version :
-- interface plus claire avec onglets : Planning, Tâches passives, Employés, Projets ;
-- compatibilité avec les fichiers JSON existants : users.json, projects.json, calendar.json,
-  user_constraints.json, passive_tasks.json ;
-- attribution rapide des tâches avec durée multi-blocs ;
-- filtres par utilisateur et projet ;
-- gestion plus propre des employés, absences, projets et tâches ;
-- sauvegarde automatique + sauvegarde manuelle + backup JSON ;
-- annuler/rétablir pour les actions principales.
-
-Dépendances :
-- Python 3.10+
-- ttkbootstrap recommandé : pip install ttkbootstrap
-- tkcalendar optionnel : pip install tkcalendar
+Application Tkinter sans dependance obligatoire:
+- donnees locales persistantes en JSON;
+- utilisateurs avec capacite par jour et jours speciaux;
+- etudes/projets avec taches en creneaux de 30 minutes;
+- recalcul automatique du planning sur une base de 8h30 par jour.
 """
 
 from __future__ import annotations
@@ -27,1497 +15,1022 @@ import os
 import shutil
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import tkinter as tk
-from tkinter import colorchooser, filedialog, messagebox
-import tkinter.ttk as ttk_std
-
-try:
-    import ttkbootstrap as ttk  # type: ignore
-    from ttkbootstrap.constants import BOTH, LEFT, RIGHT, TOP, BOTTOM, X, Y, VERTICAL, HORIZONTAL, END, W, E, N, S, CENTER
-    TT_BOOTSTRAP_AVAILABLE = True
-except Exception:
-    ttk = ttk_std  # type: ignore
-    TT_BOOTSTRAP_AVAILABLE = False
-    BOTH = tk.BOTH
-    LEFT = tk.LEFT
-    RIGHT = tk.RIGHT
-    TOP = tk.TOP
-    BOTTOM = tk.BOTTOM
-    X = tk.X
-    Y = tk.Y
-    VERTICAL = tk.VERTICAL
-    HORIZONTAL = tk.HORIZONTAL
-    END = tk.END
-    W = tk.W
-    E = tk.E
-    N = tk.N
-    S = tk.S
-    CENTER = tk.CENTER
-
-try:
-    from tkcalendar import DateEntry  # type: ignore
-    TKCALENDAR_AVAILABLE = True
-except Exception:
-    DateEntry = None  # type: ignore
-    TKCALENDAR_AVAILABLE = False
+from tkinter import messagebox
+import tkinter.ttk as ttk
 
 
-# -----------------------------------------------------------------------------
-# Constantes et configuration
-# -----------------------------------------------------------------------------
+APP_TITLE = "Planning Manager"
+APP_SIZE = "1280x820"
 
-APP_TITLE = "Planificateur employés & tâches — v25"
-APP_SIZE = "1420x860"
+SLOT_MINUTES = 30
+SLOTS_PER_DAY = 17
+WORKDAY_START = time(8, 30)
+DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
+STATUSES = ["a_planifier", "en_cours", "termine"]
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_FILES = {
-    "users": BASE_DIR / "users.json",
-    "projects": BASE_DIR / "projects.json",
-    "calendar": BASE_DIR / "calendar.json",
-    "constraints": BASE_DIR / "user_constraints.json",
-    "passive": BASE_DIR / "passive_tasks.json",
-}
-BACKUP_DIR = BASE_DIR / "planner_backups"
-
-DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
-BLOCK_LABELS = ["Bloc 1", "Bloc 2", "Bloc 3", "Bloc 4"]
-DEFAULT_PROJECT_COLOR = "#87CEEB"
-DEFAULT_EMPTY_COLOR = "#f3f4f6"
-DEFAULT_BUSY_COLOR = "#d9d9d9"
-ABSENCE_COLOR = "#ffe3e3"
-FILTERED_COLOR = "#eeeeee"
-
-# Lundi de référence historique de la v24.
-START_DATE = datetime(2025, 9, 8)
+DEFAULT_DATA_DIR = Path(os.environ.get("PLANNING_MANAGER_DATA_DIR") or Path(os.environ.get("LOCALAPPDATA", BASE_DIR)) / "MindyaPlanningManager")
 
 
-# -----------------------------------------------------------------------------
-# Utilitaires JSON / dates
-# -----------------------------------------------------------------------------
+def today_monday() -> date:
+    today = date.today()
+    return today - timedelta(days=today.weekday())
 
-def load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
+
+def parse_date(value: str) -> Optional[date]:
     try:
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as exc:
-        print(f"[load_json] Erreur lecture {path.name}: {exc}")
-        return default
-
-
-def save_json(path: Path, data: Any) -> None:
-    try:
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-    except Exception as exc:
-        print(f"[save_json] Erreur écriture {path.name}: {exc}")
-        messagebox.showerror("Erreur sauvegarde", f"Impossible de sauvegarder {path.name}:\n{exc}")
-
-
-def monday_of(day: date) -> date:
-    return day - timedelta(days=day.weekday())
-
-
-def to_date(value: str) -> Optional[date]:
-    try:
-        return datetime.strptime(value, "%Y-%m-%d").date()
+        return datetime.strptime(value.strip(), "%Y-%m-%d").date()
     except Exception:
         return None
 
 
-def week_offset_from_monday(monday: datetime) -> int:
-    return (monday - START_DATE).days // 7
+def date_to_fr(value: date) -> str:
+    return value.strftime("%d/%m/%Y")
 
 
-def normalize_calendar_dict(raw: Any) -> Dict[Tuple[int, int, int], Dict[str, str]]:
-    """Convertit les clés JSON 'w,d,b' vers des tuples (week_offset, day, block)."""
-    out: Dict[Tuple[int, int, int], Dict[str, str]] = {}
-    if not isinstance(raw, dict):
-        return out
-    for key, value in raw.items():
-        try:
-            if isinstance(key, str):
-                parts = [int(p) for p in key.split(",") if p != ""]
-            elif isinstance(key, (tuple, list)):
-                parts = [int(p) for p in key]
-            else:
-                continue
-            if len(parts) == 2:
-                w, d, b = 0, parts[0], parts[1]
-            elif len(parts) >= 3:
-                w, d, b = parts[0], parts[1], parts[2]
-            else:
-                continue
-            if isinstance(value, dict):
-                out[(w, d, b)] = {
-                    "user": str(value.get("user", "")),
-                    "project": str(value.get("project", "")),
-                    "task": str(value.get("task", "")),
-                }
-        except Exception as exc:
-            print(f"[normalize_calendar_dict] Clé ignorée {key!r}: {exc}")
-    return out
+def new_id() -> str:
+    return uuid.uuid4().hex
 
 
-def serialize_calendar(calendar: Dict[Tuple[int, int, int], Dict[str, str]]) -> Dict[str, Dict[str, str]]:
-    return {f"{w},{d},{b}": value for (w, d, b), value in sorted(calendar.items())}
+def clamp_int(value: Any, minimum: int, maximum: int, default: int) -> int:
+    try:
+        number = int(value)
+    except Exception:
+        number = default
+    return max(minimum, min(maximum, number))
 
 
-def safe_color(value: Any, fallback: str = DEFAULT_BUSY_COLOR) -> str:
-    if isinstance(value, str) and value.startswith("#") and len(value) in (4, 7):
-        return value
-    return fallback
+def slot_label(slot_index: int) -> str:
+    start_dt = datetime.combine(date.today(), WORKDAY_START) + timedelta(minutes=slot_index * SLOT_MINUTES)
+    end_dt = start_dt + timedelta(minutes=SLOT_MINUTES)
+    return f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}"
 
 
-def deep_copy_json(value: Any) -> Any:
-    return json.loads(json.dumps(value, ensure_ascii=False))
+def duration_label(slots: int) -> str:
+    minutes = max(1, slots) * SLOT_MINUTES
+    hours = minutes // 60
+    rest = minutes % 60
+    if hours and rest:
+        return f"{hours}h{rest:02d}"
+    if hours:
+        return f"{hours}h"
+    return f"{rest}min"
 
 
-# -----------------------------------------------------------------------------
-# Application
-# -----------------------------------------------------------------------------
+def read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception as exc:
+        messagebox.showerror("Lecture JSON", f"Impossible de lire {path.name}:\n{exc}")
+        return default
 
-class PlannerApp:
-    def __init__(self) -> None:
-        if TT_BOOTSTRAP_AVAILABLE:
-            self.root = ttk.Window(themename="flatly")  # type: ignore[attr-defined]
-        else:
-            self.root = tk.Tk()
-        self.root.title(APP_TITLE)
-        self.root.geometry(APP_SIZE)
-        self.root.minsize(1180, 720)
 
-        self.users: List[str] = []
-        self.user_constraints: Dict[str, Dict[str, Any]] = {}
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, ensure_ascii=False)
+    tmp.replace(path)
+
+
+@dataclass
+class ScheduleResult:
+    assignments: List[Dict[str, Any]]
+    unscheduled: List[Dict[str, Any]]
+    summary: Dict[str, int]
+
+
+class PlannerStore:
+    def __init__(self, data_dir: Path = DEFAULT_DATA_DIR) -> None:
+        self.data_dir = data_dir
+        self.paths = {
+            "users": data_dir / "users.json",
+            "projects": data_dir / "projects.json",
+            "assignments": data_dir / "assignments.json",
+            "settings": data_dir / "settings.json",
+        }
+        self.backup_dir = data_dir / "backups"
+        self.users: List[Dict[str, Any]] = []
         self.projects: List[Dict[str, Any]] = []
-        self.calendar_data: Dict[Tuple[int, int, int], Dict[str, str]] = {}
-        self.passive_tasks: List[Dict[str, Any]] = []
+        self.assignments: List[Dict[str, Any]] = []
+        self.settings: Dict[str, Any] = {}
 
-        self.current_monday = datetime.combine(monday_of(date.today()), datetime.min.time())
-        self.history: List[Dict[str, Any]] = []
-        self.redo_history: List[Dict[str, Any]] = []
+    def load(self) -> None:
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_old_files()
+        self.users = read_json(self.paths["users"], [])
+        self.projects = read_json(self.paths["projects"], [])
+        self.assignments = read_json(self.paths["assignments"], [])
+        self.settings = read_json(self.paths["settings"], {})
+        self.normalize()
+        self.save()
 
-        self.filter_user_var = tk.StringVar(value="Tous")
-        self.filter_project_var = tk.StringVar(value="Tous")
-        self.status_var = tk.StringVar(value="Prêt")
-        self.week_label_var = tk.StringVar()
+    def _migrate_old_files(self) -> None:
+        legacy = {
+            "users": BASE_DIR / "users.json",
+            "projects": BASE_DIR / "projects.json",
+            "assignments": BASE_DIR / "assignments.json",
+            "settings": BASE_DIR / "settings.json",
+        }
+        for key, source in legacy.items():
+            target = self.paths[key]
+            if source.exists() and not target.exists():
+                shutil.copy2(source, target)
 
-        self.calendar_buttons: Dict[Tuple[int, int], tk.Button] = {}
-        self.calendar_headers: List[ttk.Label] = []
-        self.passive_tree: Optional[ttk.Treeview] = None
-        self.employee_tree: Optional[ttk.Treeview] = None
-        self.project_tree: Optional[ttk.Treeview] = None
-        self.task_tree: Optional[ttk.Treeview] = None
-        self.selected_project_id: Optional[str] = None
+    def normalize(self) -> None:
+        if not isinstance(self.settings, dict):
+            self.settings = {}
+        self.settings.setdefault("planning_start", today_monday().isoformat())
+        self.settings.setdefault("horizon_weeks", 8)
+        self.settings["horizon_weeks"] = clamp_int(self.settings.get("horizon_weeks"), 1, 52, 8)
 
-        self._load_all_data()
-        self._build_ui()
-        self._bind_shortcuts()
-        self.refresh_all()
-        self.root.mainloop()
-
-    # ------------------------------------------------------------------
-    # Chargement / sauvegarde
-    # ------------------------------------------------------------------
-
-    def _load_all_data(self) -> None:
-        self.users = load_json(DATA_FILES["users"], [])
-        if not isinstance(self.users, list):
-            self.users = []
-        self.users = sorted({str(u).strip() for u in self.users if str(u).strip()}, key=str.lower)
-
-        self.user_constraints = load_json(DATA_FILES["constraints"], {})
-        if not isinstance(self.user_constraints, dict):
-            self.user_constraints = {}
-
-        self.projects = load_json(DATA_FILES["projects"], [])
-        if not isinstance(self.projects, list):
-            self.projects = []
-
-        raw_calendar = load_json(DATA_FILES["calendar"], {})
-        self.calendar_data = normalize_calendar_dict(raw_calendar)
-
-        self.passive_tasks = load_json(DATA_FILES["passive"], [])
-        if not isinstance(self.passive_tasks, list):
-            self.passive_tasks = []
-
-        self._normalize_data()
-        self.save_all(silent=True)
-
-    def _normalize_data(self) -> None:
-        # Employés
-        for user in self.users:
-            self.user_constraints.setdefault(user, {"weekly_pattern": [1, 1, 1, 1, 1], "holidays": []})
-            pattern = self.user_constraints[user].get("weekly_pattern", [1, 1, 1, 1, 1])
-            if not isinstance(pattern, list):
-                pattern = [1, 1, 1, 1, 1]
-            pattern = (pattern + [1, 1, 1, 1, 1])[:5]
-            self.user_constraints[user]["weekly_pattern"] = [1 if int(x) else 0 for x in pattern]
-            holidays = self.user_constraints[user].get("holidays", [])
-            if not isinstance(holidays, list):
-                holidays = []
-            self.user_constraints[user]["holidays"] = sorted({str(h) for h in holidays if to_date(str(h))})
-
-        # Nettoyer contraintes d'anciens employés uniquement si elles sont invalides ? On conserve volontairement.
-
-        # Projets
-        normalized_projects = []
-        seen_ids = set()
-        seen_names = set()
-        for project in self.projects:
-            if not isinstance(project, dict):
+        clean_users: List[Dict[str, Any]] = []
+        seen_user_names = set()
+        for raw in self.users if isinstance(self.users, list) else []:
+            if isinstance(raw, str):
+                raw = {"name": raw}
+            if not isinstance(raw, dict):
                 continue
-            name = str(project.get("name", "")).strip()
+            name = str(raw.get("name", "")).strip()
             if not name:
                 continue
-            pid = str(project.get("id", "")).strip() or uuid.uuid4().hex
-            if pid in seen_ids:
-                pid = uuid.uuid4().hex
-            seen_ids.add(pid)
-            if name.lower() in seen_names:
-                name = f"{name} ({pid[:4]})"
-            seen_names.add(name.lower())
-            tasks = project.get("tasks", [])
-            if not isinstance(tasks, list):
-                tasks = []
-            clean_tasks = []
-            for task in tasks:
+            lower = name.lower()
+            if lower in seen_user_names:
+                continue
+            seen_user_names.add(lower)
+            user_id = str(raw.get("id") or new_id())
+            weekly = raw.get("weekly_capacity", [SLOTS_PER_DAY] * 5)
+            if not isinstance(weekly, list):
+                weekly = [SLOTS_PER_DAY] * 5
+            weekly = (weekly + [SLOTS_PER_DAY] * 5)[:5]
+            special_days = raw.get("special_days", {})
+            if isinstance(special_days, list):
+                special_days = {str(day): 0 for day in special_days}
+            if not isinstance(special_days, dict):
+                special_days = {}
+            clean_special = {
+                str(day): clamp_int(value, 0, SLOTS_PER_DAY, 0)
+                for day, value in special_days.items()
+                if parse_date(str(day))
+            }
+            clean_users.append(
+                {
+                    "id": user_id,
+                    "name": name,
+                    "weekly_capacity": [clamp_int(x, 0, SLOTS_PER_DAY, SLOTS_PER_DAY) for x in weekly],
+                    "special_days": dict(sorted(clean_special.items())),
+                    "note": str(raw.get("note", "")),
+                }
+            )
+        self.users = sorted(clean_users, key=lambda item: item["name"].lower())
+
+        clean_projects: List[Dict[str, Any]] = []
+        seen_project_names = set()
+        valid_user_ids = {user["id"] for user in self.users}
+        for raw in self.projects if isinstance(self.projects, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name", "")).strip()
+            if not name:
+                continue
+            lower = name.lower()
+            if lower in seen_project_names:
+                name = f"{name} ({len(seen_project_names) + 1})"
+            seen_project_names.add(name.lower())
+            project_id = str(raw.get("id") or new_id())
+            tasks = []
+            for task in raw.get("tasks", []) if isinstance(raw.get("tasks", []), list) else []:
                 if not isinstance(task, dict):
                     continue
                 task_name = str(task.get("name", "")).strip()
                 if not task_name:
                     continue
-                try:
-                    duration = max(1, int(task.get("duration", 1)))
-                except Exception:
-                    duration = 1
-                clean_tasks.append({"name": task_name, "duration": duration})
-            normalized_projects.append({
-                "id": pid,
-                "name": name,
-                "tasks": sorted(clean_tasks, key=lambda t: t["name"].lower()),
-                "color": safe_color(project.get("color"), DEFAULT_PROJECT_COLOR),
-            })
-        self.projects = sorted(normalized_projects, key=lambda p: p["name"].lower())
+                assignee_id = str(task.get("assignee_id", "")).strip()
+                if assignee_id not in valid_user_ids:
+                    assignee_id = ""
+                status = str(task.get("status", "a_planifier"))
+                if status not in STATUSES:
+                    status = "a_planifier"
+                tasks.append(
+                    {
+                        "id": str(task.get("id") or new_id()),
+                        "name": task_name,
+                        "duration_slots": clamp_int(task.get("duration_slots", task.get("duration", 1)), 1, 500, 1),
+                        "priority": clamp_int(task.get("priority", 2), 0, 5, 2),
+                        "assignee_id": assignee_id,
+                        "status": status,
+                        "note": str(task.get("note", "")),
+                    }
+                )
+            clean_projects.append(
+                {
+                    "id": project_id,
+                    "name": name,
+                    "color": str(raw.get("color", "#dbeafe")),
+                    "tasks": sorted(tasks, key=lambda item: (-item["priority"], item["name"].lower())),
+                }
+            )
+        self.projects = sorted(clean_projects, key=lambda item: item["name"].lower())
 
-        # Tâches passives
-        clean_passive = []
-        for task in self.passive_tasks:
-            if not isinstance(task, dict):
-                continue
-            project = str(task.get("project", "")).strip()
-            task_name = str(task.get("task", "")).strip()
-            user = str(task.get("user", "")).strip()
-            start_date = str(task.get("start_date", "")).strip()
-            if not project or not task_name or not to_date(start_date):
-                continue
-            try:
-                duration = max(1, int(task.get("duration", 1)))
-            except Exception:
-                duration = 1
-            clean_passive.append({
-                "id": str(task.get("id", "")).strip() or uuid.uuid4().hex,
-                "project": project,
-                "task": task_name,
-                "duration": duration,
-                "start_date": start_date,
-                "user": user,
-                "note": str(task.get("note", "")),
-            })
-        self.passive_tasks = clean_passive
+        if not isinstance(self.assignments, list):
+            self.assignments = []
 
-    def snapshot(self) -> Dict[str, Any]:
+    def save(self) -> None:
+        write_json(self.paths["users"], self.users)
+        write_json(self.paths["projects"], self.projects)
+        write_json(self.paths["assignments"], self.assignments)
+        write_json(self.paths["settings"], self.settings)
+
+    def backup(self) -> Path:
+        self.save()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        target = self.backup_dir / stamp
+        target.mkdir(parents=True, exist_ok=True)
+        for path in self.paths.values():
+            if path.exists():
+                shutil.copy2(path, target / path.name)
+        return target
+
+    def user_name(self, user_id: str) -> str:
+        user = self.find_user(user_id)
+        return user["name"] if user else ""
+
+    def find_user(self, user_id: str) -> Optional[Dict[str, Any]]:
+        return next((user for user in self.users if user.get("id") == user_id), None)
+
+    def find_project(self, project_id: str) -> Optional[Dict[str, Any]]:
+        return next((project for project in self.projects if project.get("id") == project_id), None)
+
+    def find_task(self, project_id: str, task_id: str) -> Optional[Dict[str, Any]]:
+        project = self.find_project(project_id)
+        if not project:
+            return None
+        return next((task for task in project.get("tasks", []) if task.get("id") == task_id), None)
+
+    def capacity_for(self, user: Dict[str, Any], day: date) -> int:
+        if day.weekday() >= 5:
+            return 0
+        day_key = day.isoformat()
+        special_days = user.get("special_days", {})
+        if day_key in special_days:
+            return clamp_int(special_days[day_key], 0, SLOTS_PER_DAY, 0)
+        weekly = user.get("weekly_capacity", [SLOTS_PER_DAY] * 5)
+        return clamp_int(weekly[day.weekday()], 0, SLOTS_PER_DAY, SLOTS_PER_DAY)
+
+    def schedule(self) -> ScheduleResult:
+        start = parse_date(str(self.settings.get("planning_start", ""))) or today_monday()
+        start = start - timedelta(days=start.weekday())
+        weeks = clamp_int(self.settings.get("horizon_weeks"), 1, 52, 8)
+        horizon_days = weeks * 7
+        valid_users = [user for user in self.users if any(self.capacity_for(user, start + timedelta(days=i)) for i in range(horizon_days))]
+
+        occupied: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+        assignments: List[Dict[str, Any]] = []
+        unscheduled: List[Dict[str, Any]] = []
+        summary: Dict[str, int] = {user["id"]: 0 for user in self.users}
+
+        tasks = []
+        for project in self.projects:
+            for task in project.get("tasks", []):
+                if task.get("status") == "termine":
+                    continue
+                tasks.append({"project": project, "task": task})
+        tasks.sort(key=lambda item: (-item["task"].get("priority", 0), item["project"]["name"].lower(), item["task"]["name"].lower()))
+
+        for item in tasks:
+            project = item["project"]
+            task = item["task"]
+            duration_slots = clamp_int(task.get("duration_slots"), 1, 500, 1)
+            fixed_user_id = task.get("assignee_id", "")
+            candidates = [user for user in valid_users if not fixed_user_id or user["id"] == fixed_user_id]
+            if not candidates:
+                unscheduled.append(self._unscheduled_row(project, task, "Aucun utilisateur disponible"))
+                continue
+
+            best_user: Optional[Dict[str, Any]] = None
+            best_slots: Optional[List[Tuple[date, int]]] = None
+            for user in candidates:
+                slots = self._find_slots_for_user(user, duration_slots, start, horizon_days, occupied)
+                if not slots:
+                    continue
+                if best_slots is None or slots[-1] < best_slots[-1] or (slots[-1] == best_slots[-1] and summary[user["id"]] < summary.get(best_user["id"], 0)):  # type: ignore[index]
+                    best_user = user
+                    best_slots = slots
+
+            if not best_user or not best_slots:
+                unscheduled.append(self._unscheduled_row(project, task, "Pas assez de place dans l'horizon"))
+                continue
+
+            for day, slot in best_slots:
+                occupied[(best_user["id"], day.isoformat(), slot)] = {"project_id": project["id"], "task_id": task["id"]}
+            summary[best_user["id"]] = summary.get(best_user["id"], 0) + len(best_slots)
+            assignments.extend(self._group_slots(project, task, best_user, best_slots))
+
+        assignments.sort(key=lambda row: (row["date"], row["slot_index"], row["user_name"], row["project_name"], row["task_name"]))
+        self.assignments = assignments
+        self.save()
+        return ScheduleResult(assignments=assignments, unscheduled=unscheduled, summary=summary)
+
+    def _find_slots_for_user(
+        self,
+        user: Dict[str, Any],
+        duration_slots: int,
+        start: date,
+        horizon_days: int,
+        occupied: Dict[Tuple[str, str, int], Dict[str, Any]],
+    ) -> Optional[List[Tuple[date, int]]]:
+        found: List[Tuple[date, int]] = []
+        for offset in range(horizon_days):
+            day = start + timedelta(days=offset)
+            capacity = self.capacity_for(user, day)
+            if capacity <= 0:
+                continue
+            for slot in range(capacity):
+                key = (user["id"], day.isoformat(), slot)
+                if key in occupied:
+                    continue
+                found.append((day, slot))
+                if len(found) == duration_slots:
+                    return found
+        return None
+
+    def _group_slots(
+        self,
+        project: Dict[str, Any],
+        task: Dict[str, Any],
+        user: Dict[str, Any],
+        slots: List[Tuple[date, int]],
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        current_day: Optional[date] = None
+        current_start: Optional[int] = None
+        current_count = 0
+        previous_slot: Optional[int] = None
+
+        def flush() -> None:
+            nonlocal current_day, current_start, current_count
+            if current_day is None or current_start is None or current_count <= 0:
+                return
+            rows.append(
+                {
+                    "id": new_id(),
+                    "date": current_day.isoformat(),
+                    "slot_index": current_start,
+                    "duration_slots": current_count,
+                    "user_id": user["id"],
+                    "user_name": user["name"],
+                    "project_id": project["id"],
+                    "project_name": project["name"],
+                    "task_id": task["id"],
+                    "task_name": task["name"],
+                    "priority": task.get("priority", 0),
+                    "status": task.get("status", "a_planifier"),
+                }
+            )
+
+        for day, slot in slots:
+            if current_day == day and previous_slot is not None and slot == previous_slot + 1:
+                current_count += 1
+            else:
+                flush()
+                current_day = day
+                current_start = slot
+                current_count = 1
+            previous_slot = slot
+        flush()
+        return rows
+
+    @staticmethod
+    def _unscheduled_row(project: Dict[str, Any], task: Dict[str, Any], reason: str) -> Dict[str, Any]:
         return {
-            "users": list(self.users),
-            "constraints": deep_copy_json(self.user_constraints),
-            "projects": deep_copy_json(self.projects),
-            "calendar": serialize_calendar(self.calendar_data),
-            "passive": deep_copy_json(self.passive_tasks),
+            "project_name": project.get("name", ""),
+            "task_name": task.get("name", ""),
+            "duration_slots": task.get("duration_slots", 1),
+            "priority": task.get("priority", 0),
+            "reason": reason,
         }
 
-    def push_history(self) -> None:
-        self.history.append(self.snapshot())
-        if len(self.history) > 50:
-            self.history.pop(0)
-        self.redo_history.clear()
 
-    def restore_snapshot(self, snap: Dict[str, Any]) -> None:
-        self.users = sorted(snap.get("users", []), key=str.lower)
-        self.user_constraints = snap.get("constraints", {})
-        self.projects = snap.get("projects", [])
-        self.calendar_data = normalize_calendar_dict(snap.get("calendar", {}))
-        self.passive_tasks = snap.get("passive", [])
-        self._normalize_data()
-        self.save_all(silent=True)
+class PlannerApp:
+    def __init__(self) -> None:
+        self.store = PlannerStore()
+        self.store.load()
+
+        self.root = tk.Tk()
+        self.root.title(APP_TITLE)
+        self.root.geometry(APP_SIZE)
+        self.root.minsize(1100, 700)
+
+        self.status_var = tk.StringVar(value="Pret")
+        self.filter_user_var = tk.StringVar(value="Tous")
+        self.filter_project_var = tk.StringVar(value="Tous")
+        self.start_var = tk.StringVar(value=str(self.store.settings.get("planning_start", today_monday().isoformat())))
+        self.weeks_var = tk.StringVar(value=str(self.store.settings.get("horizon_weeks", 8)))
+        self.selected_project_id: Optional[str] = None
+
+        self._build_ui()
+        self.recalculate_schedule(silent=True)
         self.refresh_all()
-
-    def save_all(self, silent: bool = False) -> None:
-        save_json(DATA_FILES["users"], self.users)
-        save_json(DATA_FILES["constraints"], self.user_constraints)
-        save_json(DATA_FILES["projects"], self.projects)
-        save_json(DATA_FILES["calendar"], serialize_calendar(self.calendar_data))
-        save_json(DATA_FILES["passive"], self.passive_tasks)
-        if not silent:
-            self.set_status("Sauvegarde terminée")
-
-    def backup_data(self) -> None:
-        BACKUP_DIR.mkdir(exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest = BACKUP_DIR / f"backup_{stamp}"
-        dest.mkdir(exist_ok=True)
-        for path in DATA_FILES.values():
-            if path.exists():
-                shutil.copy2(path, dest / path.name)
-        self.set_status(f"Backup créé : {dest.name}")
-        messagebox.showinfo("Backup", f"Backup créé dans :\n{dest}")
-
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
+        self.root.mainloop()
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
-        self._build_top_bar()
+        top = ttk.Frame(self.root)
+        top.grid(row=0, column=0, sticky="ew", padx=10, pady=8)
+        top.columnconfigure(14, weight=1)
+
+        ttk.Label(top, text="Debut").grid(row=0, column=0, padx=(0, 4))
+        ttk.Entry(top, textvariable=self.start_var, width=12).grid(row=0, column=1, padx=3)
+        ttk.Label(top, text="Semaines").grid(row=0, column=2, padx=(10, 4))
+        ttk.Spinbox(top, from_=1, to=52, textvariable=self.weeks_var, width=5).grid(row=0, column=3, padx=3)
+        ttk.Button(top, text="Recalculer planning", command=self.recalculate_schedule).grid(row=0, column=4, padx=8)
+        ttk.Button(top, text="Sauver", command=self.save_all).grid(row=0, column=5, padx=3)
+        ttk.Button(top, text="Backup", command=self.backup).grid(row=0, column=6, padx=3)
+
+        ttk.Label(top, text="Utilisateur").grid(row=0, column=8, padx=(18, 4))
+        self.user_filter = ttk.Combobox(top, textvariable=self.filter_user_var, state="readonly", width=18)
+        self.user_filter.grid(row=0, column=9, padx=3)
+        self.user_filter.bind("<<ComboboxSelected>>", lambda _event: self.refresh_schedule_tree())
+        ttk.Label(top, text="Etude").grid(row=0, column=10, padx=(10, 4))
+        self.project_filter = ttk.Combobox(top, textvariable=self.filter_project_var, state="readonly", width=22)
+        self.project_filter.grid(row=0, column=11, padx=3)
+        self.project_filter.bind("<<ComboboxSelected>>", lambda _event: self.refresh_schedule_tree())
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 6))
 
         self.tab_planning = ttk.Frame(self.notebook)
-        self.tab_passive = ttk.Frame(self.notebook)
-        self.tab_employees = ttk.Frame(self.notebook)
+        self.tab_users = ttk.Frame(self.notebook)
         self.tab_projects = ttk.Frame(self.notebook)
-
-        self.notebook.add(self.tab_planning, text="📅 Planning")
-        self.notebook.add(self.tab_passive, text="⏳ Tâches passives")
-        self.notebook.add(self.tab_employees, text="👥 Employés")
-        self.notebook.add(self.tab_projects, text="📦 Projets & tâches")
+        self.tab_settings = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_planning, text="Planning")
+        self.notebook.add(self.tab_users, text="Utilisateurs")
+        self.notebook.add(self.tab_projects, text="Etudes et taches")
+        self.notebook.add(self.tab_settings, text="Donnees")
 
         self._build_planning_tab()
-        self._build_passive_tab()
-        self._build_employees_tab()
+        self._build_users_tab()
         self._build_projects_tab()
+        self._build_settings_tab()
 
-        status = ttk.Label(self.root, textvariable=self.status_var, anchor="w")
-        status.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 6))
-
-    def _build_top_bar(self) -> None:
-        top = ttk.Frame(self.root)
-        top.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
-        top.columnconfigure(8, weight=1)
-
-        ttk.Button(top, text="◀ Semaine", command=self.prev_week).grid(row=0, column=0, padx=3)
-        ttk.Button(top, text="Aujourd'hui", command=self.goto_today).grid(row=0, column=1, padx=3)
-        ttk.Button(top, text="Semaine ▶", command=self.next_week).grid(row=0, column=2, padx=3)
-
-        ttk.Label(top, textvariable=self.week_label_var, font=("Segoe UI", 12, "bold")).grid(row=0, column=3, padx=18)
-
-        ttk.Label(top, text="Filtre employé").grid(row=0, column=4, padx=(12, 4))
-        self.filter_user_cb = ttk.Combobox(top, textvariable=self.filter_user_var, state="readonly", width=18)
-        self.filter_user_cb.grid(row=0, column=5, padx=3)
-        self.filter_user_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_planning())
-
-        ttk.Label(top, text="Filtre projet").grid(row=0, column=6, padx=(12, 4))
-        self.filter_project_cb = ttk.Combobox(top, textvariable=self.filter_project_var, state="readonly", width=22)
-        self.filter_project_cb.grid(row=0, column=7, padx=3)
-        self.filter_project_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_planning())
-
-        ttk.Button(top, text="Sauver", command=lambda: self.save_all(silent=False)).grid(row=0, column=9, padx=3, sticky="e")
-        ttk.Button(top, text="Backup", command=self.backup_data).grid(row=0, column=10, padx=3, sticky="e")
-        ttk.Button(top, text="Annuler", command=self.undo).grid(row=0, column=11, padx=3, sticky="e")
-        ttk.Button(top, text="Rétablir", command=self.redo).grid(row=0, column=12, padx=3, sticky="e")
+        ttk.Label(self.root, textvariable=self.status_var, anchor="w").grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 6))
 
     def _build_planning_tab(self) -> None:
         self.tab_planning.columnconfigure(0, weight=1)
         self.tab_planning.rowconfigure(1, weight=1)
 
-        help_frame = ttk.Frame(self.tab_planning)
-        help_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
-        ttk.Label(
-            help_frame,
-            text="Clique sur un bloc pour attribuer, modifier ou supprimer une tâche. Les tâches longues se posent automatiquement sur plusieurs blocs.",
-            anchor="w",
-        ).pack(side=LEFT, fill=X, expand=True)
-        ttk.Button(help_frame, text="+ Tâche rapide", command=self.open_assignment_dialog).pack(side=RIGHT, padx=4)
-        ttk.Button(help_frame, text="Nettoyer semaine affichée", command=self.clear_current_week).pack(side=RIGHT, padx=4)
-
-        grid_frame = ttk.LabelFrame(self.tab_planning, text="Planning semaine")
-        grid_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
-        for col in range(6):
-            grid_frame.columnconfigure(col, weight=1)
-        for row in range(6):
-            grid_frame.rowconfigure(row, weight=1)
-
-        ttk.Label(grid_frame, text="", anchor="center").grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-        self.calendar_headers = []
-        for day_index, day_name in enumerate(DAYS):
-            lbl = ttk.Label(grid_frame, text=day_name, anchor="center", font=("Segoe UI", 11, "bold"))
-            lbl.grid(row=0, column=day_index + 1, sticky="nsew", padx=4, pady=4)
-            self.calendar_headers.append(lbl)
-
-        for block_index, label in enumerate(BLOCK_LABELS):
-            ttk.Label(grid_frame, text=label, anchor="center", font=("Segoe UI", 10, "bold")).grid(
-                row=block_index + 1, column=0, sticky="nsew", padx=4, pady=4
-            )
-            for day_index in range(5):
-                btn = tk.Button(
-                    grid_frame,
-                    text="",
-                    wraplength=185,
-                    justify="center",
-                    relief="groove",
-                    borderwidth=1,
-                    bg=DEFAULT_EMPTY_COLOR,
-                    activebackground="#e2e8f0",
-                    command=lambda d=day_index, b=block_index: self.open_assignment_dialog(d, b),
-                )
-                btn.grid(row=block_index + 1, column=day_index + 1, sticky="nsew", padx=4, pady=4, ipady=16)
-                self.calendar_buttons[(day_index, block_index)] = btn
-
-        summary = ttk.LabelFrame(self.tab_planning, text="Résumé semaine")
-        summary.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
-        summary.columnconfigure(0, weight=1)
-        self.week_summary_var = tk.StringVar()
-        ttk.Label(summary, textvariable=self.week_summary_var, anchor="w").grid(row=0, column=0, sticky="ew", padx=8, pady=6)
-
-    def _build_passive_tab(self) -> None:
-        self.tab_passive.columnconfigure(0, weight=1)
-        self.tab_passive.rowconfigure(1, weight=1)
-
-        toolbar = ttk.Frame(self.tab_passive)
+        toolbar = ttk.Frame(self.tab_planning)
         toolbar.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
-        ttk.Button(toolbar, text="+ Ajouter tâche passive", command=self.open_passive_dialog).pack(side=LEFT, padx=3)
-        ttk.Button(toolbar, text="Supprimer sélection", command=self.delete_selected_passive_task).pack(side=LEFT, padx=3)
-        ttk.Button(toolbar, text="Convertir en planning", command=self.convert_passive_to_calendar).pack(side=LEFT, padx=3)
-        ttk.Label(toolbar, text="Les tâches passives sont des tâches à planifier plus tard ou à garder en attente.").pack(side=LEFT, padx=18)
+        ttk.Button(toolbar, text="Marquer tache terminee", command=self.mark_selected_task_done).pack(side=tk.LEFT, padx=3)
+        ttk.Button(toolbar, text="Mettre en urgent", command=self.mark_selected_task_urgent).pack(side=tk.LEFT, padx=3)
+        ttk.Button(toolbar, text="Aller a la tache", command=self.focus_selected_task).pack(side=tk.LEFT, padx=3)
 
-        columns = ("start", "duration", "user", "project", "task", "note")
-        self.passive_tree = ttk.Treeview(self.tab_passive, columns=columns, show="headings", height=18)
+        columns = ("date", "time", "user", "project", "task", "duration", "priority", "status")
+        self.schedule_tree = ttk.Treeview(self.tab_planning, columns=columns, show="headings")
         headers = {
-            "start": "Début",
-            "duration": "Jours ouvrés",
-            "user": "Employé",
-            "project": "Projet",
-            "task": "Tâche",
-            "note": "Note",
+            "date": "Date",
+            "time": "Heure",
+            "user": "Utilisateur",
+            "project": "Etude",
+            "task": "Tache",
+            "duration": "Duree",
+            "priority": "Priorite",
+            "status": "Statut",
         }
-        widths = {"start": 95, "duration": 90, "user": 140, "project": 190, "task": 280, "note": 360}
+        widths = {"date": 95, "time": 95, "user": 150, "project": 210, "task": 360, "duration": 70, "priority": 70, "status": 100}
         for col in columns:
-            self.passive_tree.heading(col, text=headers[col])
-            self.passive_tree.column(col, width=widths[col], anchor="w")
-        self.passive_tree.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
-        sb = ttk.Scrollbar(self.tab_passive, orient=VERTICAL, command=self.passive_tree.yview)
+            self.schedule_tree.heading(col, text=headers[col])
+            self.schedule_tree.column(col, width=widths[col], anchor="w")
+        self.schedule_tree.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        sb = ttk.Scrollbar(self.tab_planning, orient=tk.VERTICAL, command=self.schedule_tree.yview)
         sb.grid(row=1, column=1, sticky="ns", pady=(0, 8))
-        self.passive_tree.configure(yscrollcommand=sb.set)
-        self.passive_tree.bind("<Double-1>", lambda e: self.open_passive_dialog(edit=True))
+        self.schedule_tree.configure(yscrollcommand=sb.set)
 
-    def _build_employees_tab(self) -> None:
-        self.tab_employees.columnconfigure(0, weight=1)
-        self.tab_employees.columnconfigure(1, weight=1)
-        self.tab_employees.rowconfigure(1, weight=1)
+        self.summary_var = tk.StringVar()
+        ttk.Label(self.tab_planning, textvariable=self.summary_var, anchor="w").grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
 
-        toolbar = ttk.Frame(self.tab_employees)
-        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
-        ttk.Button(toolbar, text="+ Ajouter employé", command=self.add_employee_dialog).pack(side=LEFT, padx=3)
-        ttk.Button(toolbar, text="Renommer", command=self.rename_employee_dialog).pack(side=LEFT, padx=3)
-        ttk.Button(toolbar, text="Supprimer", command=self.delete_employee).pack(side=LEFT, padx=3)
-        ttk.Button(toolbar, text="Modifier disponibilités", command=self.edit_employee_constraints).pack(side=LEFT, padx=3)
+    def _build_users_tab(self) -> None:
+        self.tab_users.columnconfigure(0, weight=1)
+        self.tab_users.rowconfigure(1, weight=1)
 
-        columns = ("name", "availability", "holidays")
-        self.employee_tree = ttk.Treeview(self.tab_employees, columns=columns, show="headings", height=18)
-        self.employee_tree.heading("name", text="Employé")
-        self.employee_tree.heading("availability", text="Disponibilité hebdo")
-        self.employee_tree.heading("holidays", text="Absences spécifiques")
-        self.employee_tree.column("name", width=220, anchor="w")
-        self.employee_tree.column("availability", width=360, anchor="w")
-        self.employee_tree.column("holidays", width=420, anchor="w")
-        self.employee_tree.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=8, pady=(0, 8))
-        self.employee_tree.bind("<Double-1>", lambda e: self.edit_employee_constraints())
+        toolbar = ttk.Frame(self.tab_users)
+        toolbar.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        ttk.Button(toolbar, text="+ Utilisateur", command=self.add_user).pack(side=tk.LEFT, padx=3)
+        ttk.Button(toolbar, text="Modifier", command=self.edit_user).pack(side=tk.LEFT, padx=3)
+        ttk.Button(toolbar, text="Supprimer", command=self.delete_user).pack(side=tk.LEFT, padx=3)
+
+        columns = ("name", "weekly", "special", "note")
+        self.user_tree = ttk.Treeview(self.tab_users, columns=columns, show="headings")
+        headers = {"name": "Nom", "weekly": "Capacite hebdo", "special": "Jours speciaux", "note": "Note"}
+        widths = {"name": 180, "weekly": 400, "special": 260, "note": 300}
+        for col in columns:
+            self.user_tree.heading(col, text=headers[col])
+            self.user_tree.column(col, width=widths[col], anchor="w")
+        self.user_tree.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self.user_tree.bind("<Double-1>", lambda _event: self.edit_user())
 
     def _build_projects_tab(self) -> None:
         self.tab_projects.columnconfigure(0, weight=1)
-        self.tab_projects.columnconfigure(1, weight=1)
+        self.tab_projects.columnconfigure(1, weight=2)
         self.tab_projects.rowconfigure(1, weight=1)
 
         toolbar = ttk.Frame(self.tab_projects)
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
-        ttk.Button(toolbar, text="+ Projet", command=self.add_project_dialog).pack(side=LEFT, padx=3)
-        ttk.Button(toolbar, text="Renommer projet", command=self.rename_project_dialog).pack(side=LEFT, padx=3)
-        ttk.Button(toolbar, text="Couleur", command=self.choose_project_color).pack(side=LEFT, padx=3)
-        ttk.Button(toolbar, text="Supprimer projet", command=self.delete_project).pack(side=LEFT, padx=3)
-        ttk.Separator(toolbar, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=10)
-        ttk.Button(toolbar, text="+ Tâche", command=self.add_task_dialog).pack(side=LEFT, padx=3)
-        ttk.Button(toolbar, text="Modifier tâche", command=self.edit_task_dialog).pack(side=LEFT, padx=3)
-        ttk.Button(toolbar, text="Supprimer tâche", command=self.delete_task).pack(side=LEFT, padx=3)
+        ttk.Button(toolbar, text="+ Etude", command=self.add_project).pack(side=tk.LEFT, padx=3)
+        ttk.Button(toolbar, text="Modifier etude", command=self.edit_project).pack(side=tk.LEFT, padx=3)
+        ttk.Button(toolbar, text="Supprimer etude", command=self.delete_project).pack(side=tk.LEFT, padx=3)
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        ttk.Button(toolbar, text="+ Tache", command=self.add_task).pack(side=tk.LEFT, padx=3)
+        ttk.Button(toolbar, text="Modifier tache", command=self.edit_task).pack(side=tk.LEFT, padx=3)
+        ttk.Button(toolbar, text="Supprimer tache", command=self.delete_task).pack(side=tk.LEFT, padx=3)
 
-        project_frame = ttk.LabelFrame(self.tab_projects, text="Projets")
-        project_frame.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=(0, 8))
-        project_frame.rowconfigure(0, weight=1)
-        project_frame.columnconfigure(0, weight=1)
+        self.project_tree = ttk.Treeview(self.tab_projects, columns=("name", "tasks"), show="headings")
+        self.project_tree.heading("name", text="Etude")
+        self.project_tree.heading("tasks", text="Taches")
+        self.project_tree.column("name", width=260, anchor="w")
+        self.project_tree.column("tasks", width=70, anchor="center")
+        self.project_tree.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=(0, 8))
+        self.project_tree.bind("<<TreeviewSelect>>", lambda _event: self.on_project_selected())
+        self.project_tree.bind("<Double-1>", lambda _event: self.edit_project())
 
-        self.project_tree = ttk.Treeview(project_frame, columns=("name", "tasks", "color"), show="headings", height=18)
-        self.project_tree.heading("name", text="Projet")
-        self.project_tree.heading("tasks", text="Nb tâches")
-        self.project_tree.heading("color", text="Couleur")
-        self.project_tree.column("name", width=280, anchor="w")
-        self.project_tree.column("tasks", width=80, anchor="center")
-        self.project_tree.column("color", width=90, anchor="center")
-        self.project_tree.grid(row=0, column=0, sticky="nsew")
-        self.project_tree.bind("<<TreeviewSelect>>", lambda e: self.on_project_selected())
-        self.project_tree.bind("<Double-1>", lambda e: self.rename_project_dialog())
+        columns = ("name", "duration", "priority", "assignee", "status", "note")
+        self.task_tree = ttk.Treeview(self.tab_projects, columns=columns, show="headings")
+        headers = {"name": "Tache", "duration": "Duree", "priority": "Priorite", "assignee": "Utilisateur", "status": "Statut", "note": "Note"}
+        widths = {"name": 280, "duration": 80, "priority": 70, "assignee": 140, "status": 100, "note": 220}
+        for col in columns:
+            self.task_tree.heading(col, text=headers[col])
+            self.task_tree.column(col, width=widths[col], anchor="w")
+        self.task_tree.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=(0, 8))
+        self.task_tree.bind("<Double-1>", lambda _event: self.edit_task())
 
-        task_frame = ttk.LabelFrame(self.tab_projects, text="Tâches du projet sélectionné")
-        task_frame.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=(0, 8))
-        task_frame.rowconfigure(0, weight=1)
-        task_frame.columnconfigure(0, weight=1)
-
-        self.task_tree = ttk.Treeview(task_frame, columns=("name", "duration"), show="headings", height=18)
-        self.task_tree.heading("name", text="Tâche")
-        self.task_tree.heading("duration", text="Durée blocs")
-        self.task_tree.column("name", width=420, anchor="w")
-        self.task_tree.column("duration", width=100, anchor="center")
-        self.task_tree.grid(row=0, column=0, sticky="nsew")
-        self.task_tree.bind("<Double-1>", lambda e: self.edit_task_dialog())
-
-    def _bind_shortcuts(self) -> None:
-        self.root.bind("<Control-s>", lambda e: self.save_all(silent=False))
-        self.root.bind("<Control-z>", lambda e: self.undo())
-        self.root.bind("<Control-y>", lambda e: self.redo())
-        self.root.bind("<F5>", lambda e: self.refresh_all())
-        self.root.bind("<Control-n>", lambda e: self.open_assignment_dialog())
-
-    # ------------------------------------------------------------------
-    # Refresh UI
-    # ------------------------------------------------------------------
+    def _build_settings_tab(self) -> None:
+        self.tab_settings.columnconfigure(1, weight=1)
+        ttk.Label(self.tab_settings, text="Dossier de donnees").grid(row=0, column=0, sticky="w", padx=12, pady=(16, 6))
+        ttk.Label(self.tab_settings, text=str(self.store.data_dir)).grid(row=0, column=1, sticky="w", padx=12, pady=(16, 6))
+        ttk.Label(self.tab_settings, text="Fichiers").grid(row=1, column=0, sticky="nw", padx=12, pady=6)
+        files = "\n".join(path.name for path in self.store.paths.values())
+        ttk.Label(self.tab_settings, text=files).grid(row=1, column=1, sticky="w", padx=12, pady=6)
+        ttk.Label(
+            self.tab_settings,
+            text="Les donnees sont rechargees au demarrage et sauvegardees apres chaque action.",
+            wraplength=760,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=12)
 
     def refresh_all(self) -> None:
-        self._normalize_data()
+        self.store.normalize()
         self.refresh_filters()
-        self.refresh_planning()
-        self.refresh_passive_tree()
-        self.refresh_employee_tree()
+        self.refresh_schedule_tree()
+        self.refresh_user_tree()
         self.refresh_project_tree()
-        self.set_status("Interface actualisée")
 
     def refresh_filters(self) -> None:
-        users = ["Tous"] + sorted(self.users, key=str.lower)
+        users = ["Tous"] + [user["name"] for user in self.store.users]
+        projects = ["Tous"] + [project["name"] for project in self.store.projects]
+        self.user_filter["values"] = users
+        self.project_filter["values"] = projects
         if self.filter_user_var.get() not in users:
             self.filter_user_var.set("Tous")
-        self.filter_user_cb["values"] = users
-
-        project_names = ["Tous"] + [p["name"] for p in sorted(self.projects, key=lambda p: p["name"].lower())]
-        if self.filter_project_var.get() not in project_names:
+        if self.filter_project_var.get() not in projects:
             self.filter_project_var.set("Tous")
-        self.filter_project_cb["values"] = project_names
 
-    def refresh_planning(self) -> None:
-        week_start = self.current_monday.date()
-        week_end = week_start + timedelta(days=4)
-        self.week_label_var.set(f"Semaine du {week_start.strftime('%d/%m/%Y')} au {week_end.strftime('%d/%m/%Y')}")
-
-        for d, lbl in enumerate(self.calendar_headers):
-            day_date = week_start + timedelta(days=d)
-            lbl.configure(text=f"{DAYS[d]}\n{day_date.strftime('%d/%m/%Y')}")
-
-        week_offset = week_offset_from_monday(self.current_monday)
-        filter_user = self.filter_user_var.get()
-        filter_project = self.filter_project_var.get()
-        counts_by_user: Dict[str, int] = {}
-        counts_by_project: Dict[str, int] = {}
-
-        for day_index in range(5):
-            day_date = week_start + timedelta(days=day_index)
-            for block_index in range(4):
-                key = (week_offset, day_index, block_index)
-                btn = self.calendar_buttons[(day_index, block_index)]
-                entry = self.calendar_data.get(key)
-
-                absent_hint = ""
-                absent_for_filter = False
-                if filter_user != "Tous" and self.is_user_absent(filter_user, day_date):
-                    absent_for_filter = True
-                    absent_hint = "\n(absent)"
-
-                if not entry:
-                    bg = ABSENCE_COLOR if absent_for_filter else DEFAULT_EMPTY_COLOR
-                    text = f"Libre{absent_hint}" if absent_for_filter else "Libre"
-                    btn.configure(text=text, bg=bg, fg="black")
-                    continue
-
-                user = entry.get("user", "")
-                project = entry.get("project", "")
-                task = entry.get("task", "")
-                visible = True
-                if filter_user != "Tous" and user != filter_user:
-                    visible = False
-                if filter_project != "Tous" and project != filter_project:
-                    visible = False
-
-                counts_by_user[user] = counts_by_user.get(user, 0) + 1
-                counts_by_project[project] = counts_by_project.get(project, 0) + 1
-
-                if not visible:
-                    btn.configure(text="Masqué par filtre", bg=FILTERED_COLOR, fg="#777777")
-                    continue
-
-                project_obj = self.find_project_by_name(project)
-                color = safe_color(project_obj.get("color") if project_obj else None, DEFAULT_BUSY_COLOR)
-                warning = " ⚠ absent" if self.is_user_absent(user, day_date) else ""
-                btn.configure(text=f"{project}\n{task}\n👤 {user}{warning}", bg=color, fg="black")
-
-        user_bits = ", ".join(f"{u}: {n} bloc(s)" for u, n in sorted(counts_by_user.items(), key=lambda x: x[0].lower())) or "Aucun bloc planifié"
-        project_bits = ", ".join(f"{p}: {n}" for p, n in sorted(counts_by_project.items(), key=lambda x: x[0].lower())) or "Aucun projet"
-        self.week_summary_var.set(f"Charge par employé — {user_bits}    |    Charge par projet — {project_bits}")
-
-    def refresh_passive_tree(self) -> None:
-        if self.passive_tree is None:
-            return
-        self.passive_tree.delete(*self.passive_tree.get_children())
-        for task in sorted(self.passive_tasks, key=lambda t: (t.get("start_date", ""), t.get("project", ""), t.get("task", ""))):
-            self.passive_tree.insert(
+    def refresh_schedule_tree(self) -> None:
+        self.schedule_tree.delete(*self.schedule_tree.get_children())
+        user_filter = self.filter_user_var.get()
+        project_filter = self.filter_project_var.get()
+        total_slots = 0
+        for row in self.store.assignments:
+            if user_filter != "Tous" and row.get("user_name") != user_filter:
+                continue
+            if project_filter != "Tous" and row.get("project_name") != project_filter:
+                continue
+            day = parse_date(row.get("date", ""))
+            date_text = date_to_fr(day) if day else row.get("date", "")
+            total_slots += int(row.get("duration_slots", 0))
+            self.schedule_tree.insert(
                 "",
-                END,
+                tk.END,
+                iid=row["id"],
+                values=(
+                    date_text,
+                    slot_label(int(row.get("slot_index", 0))),
+                    row.get("user_name", ""),
+                    row.get("project_name", ""),
+                    row.get("task_name", ""),
+                    duration_label(int(row.get("duration_slots", 1))),
+                    row.get("priority", 0),
+                    row.get("status", ""),
+                ),
+            )
+        self.summary_var.set(f"Charge affichee: {duration_label(total_slots)} sur {len(self.store.assignments)} segment(s) planifie(s)")
+
+    def refresh_user_tree(self) -> None:
+        self.user_tree.delete(*self.user_tree.get_children())
+        for user in self.store.users:
+            weekly = ", ".join(f"{DAYS[i]} {duration_label(cap)}" for i, cap in enumerate(user.get("weekly_capacity", [])[:5]))
+            special_count = len(user.get("special_days", {}))
+            self.user_tree.insert("", tk.END, iid=user["id"], values=(user["name"], weekly, f"{special_count} jour(s)", user.get("note", "")))
+
+    def refresh_project_tree(self) -> None:
+        self.project_tree.delete(*self.project_tree.get_children())
+        for project in self.store.projects:
+            self.project_tree.insert("", tk.END, iid=project["id"], values=(project["name"], len(project.get("tasks", []))))
+        if self.selected_project_id and self.selected_project_id in self.project_tree.get_children(""):
+            self.project_tree.selection_set(self.selected_project_id)
+        elif self.store.projects:
+            self.selected_project_id = self.store.projects[0]["id"]
+            self.project_tree.selection_set(self.selected_project_id)
+        self.refresh_task_tree()
+
+    def refresh_task_tree(self) -> None:
+        self.task_tree.delete(*self.task_tree.get_children())
+        project = self.store.find_project(self.selected_project_id or "")
+        if not project:
+            return
+        for task in project.get("tasks", []):
+            assignee = self.store.user_name(task.get("assignee_id", "")) or "Auto"
+            self.task_tree.insert(
+                "",
+                tk.END,
                 iid=task["id"],
                 values=(
-                    task.get("start_date", ""),
-                    task.get("duration", 1),
-                    task.get("user", ""),
-                    task.get("project", ""),
-                    task.get("task", ""),
+                    task["name"],
+                    duration_label(task.get("duration_slots", 1)),
+                    task.get("priority", 0),
+                    assignee,
+                    task.get("status", ""),
                     task.get("note", ""),
                 ),
             )
 
-    def refresh_employee_tree(self) -> None:
-        if self.employee_tree is None:
+    def save_all(self) -> None:
+        start = parse_date(self.start_var.get())
+        if not start:
+            messagebox.showerror("Date invalide", "Le debut doit etre au format YYYY-MM-DD.")
             return
-        self.employee_tree.delete(*self.employee_tree.get_children())
-        for user in sorted(self.users, key=str.lower):
-            constraints = self.user_constraints.get(user, {})
-            pattern = constraints.get("weekly_pattern", [1, 1, 1, 1, 1])
-            availability = ", ".join(DAYS[i] for i, flag in enumerate(pattern[:5]) if int(flag)) or "Aucun jour"
-            holidays = ", ".join(constraints.get("holidays", [])) or "—"
-            self.employee_tree.insert("", END, iid=user, values=(user, availability, holidays))
+        self.store.settings["planning_start"] = (start - timedelta(days=start.weekday())).isoformat()
+        self.store.settings["horizon_weeks"] = clamp_int(self.weeks_var.get(), 1, 52, 8)
+        self.start_var.set(self.store.settings["planning_start"])
+        self.weeks_var.set(str(self.store.settings["horizon_weeks"]))
+        self.store.normalize()
+        self.store.save()
+        self.set_status("Donnees sauvegardees")
 
-    def refresh_project_tree(self) -> None:
-        if self.project_tree is None or self.task_tree is None:
-            return
-        selected = self.selected_project_id
-        self.project_tree.delete(*self.project_tree.get_children())
-        for project in sorted(self.projects, key=lambda p: p["name"].lower()):
-            self.project_tree.insert(
-                "",
-                END,
-                iid=project["id"],
-                values=(project["name"], len(project.get("tasks", [])), project.get("color", "")),
-            )
-        if selected and selected in self.project_tree.get_children(""):
-            self.project_tree.selection_set(selected)
-        elif self.projects:
-            first = sorted(self.projects, key=lambda p: p["name"].lower())[0]["id"]
-            self.project_tree.selection_set(first)
-            self.selected_project_id = first
-        self.refresh_task_tree()
+    def recalculate_schedule(self, silent: bool = False) -> None:
+        self.save_all()
+        result = self.store.schedule()
+        self.refresh_all()
+        if result.unscheduled and not silent:
+            details = "\n".join(f"- {row['project_name']} / {row['task_name']}: {row['reason']}" for row in result.unscheduled[:12])
+            more = "" if len(result.unscheduled) <= 12 else f"\n... et {len(result.unscheduled) - 12} autre(s)"
+            messagebox.showwarning("Taches non planifiees", details + more)
+        self.set_status(f"Planning recalcule: {len(result.assignments)} segment(s), {len(result.unscheduled)} non planifiee(s)")
 
-    def refresh_task_tree(self) -> None:
-        if self.task_tree is None:
-            return
-        self.task_tree.delete(*self.task_tree.get_children())
-        project = self.find_project_by_id(self.selected_project_id)
-        if not project:
-            return
-        for index, task in enumerate(sorted(project.get("tasks", []), key=lambda t: t["name"].lower())):
-            self.task_tree.insert("", END, iid=str(index), values=(task["name"], task["duration"]))
-
-    def on_project_selected(self) -> None:
-        if not self.project_tree:
-            return
-        sel = self.project_tree.selection()
-        self.selected_project_id = sel[0] if sel else None
-        self.refresh_task_tree()
+    def backup(self) -> None:
+        target = self.store.backup()
+        self.set_status(f"Backup cree: {target}")
+        messagebox.showinfo("Backup", f"Backup cree dans:\n{target}")
 
     def set_status(self, text: str) -> None:
         self.status_var.set(text)
 
-    # ------------------------------------------------------------------
-    # Navigation semaine
-    # ------------------------------------------------------------------
+    def selected_user(self) -> Optional[Dict[str, Any]]:
+        selection = self.user_tree.selection()
+        return self.store.find_user(selection[0]) if selection else None
 
-    def prev_week(self) -> None:
-        self.current_monday -= timedelta(days=7)
-        self.refresh_planning()
+    def selected_project(self) -> Optional[Dict[str, Any]]:
+        selection = self.project_tree.selection()
+        if selection:
+            self.selected_project_id = selection[0]
+        return self.store.find_project(self.selected_project_id or "")
 
-    def next_week(self) -> None:
-        self.current_monday += timedelta(days=7)
-        self.refresh_planning()
-
-    def goto_today(self) -> None:
-        self.current_monday = datetime.combine(monday_of(date.today()), datetime.min.time())
-        self.refresh_planning()
-
-    # ------------------------------------------------------------------
-    # Planning actions
-    # ------------------------------------------------------------------
-
-    def open_assignment_dialog(self, day_index: Optional[int] = None, block_index: Optional[int] = None) -> None:
-        if not self.users:
-            messagebox.showwarning("Employés", "Ajoute au moins un employé avant de planifier une tâche.")
-            self.notebook.select(self.tab_employees)
-            return
-        if not self.projects:
-            messagebox.showwarning("Projets", "Ajoute au moins un projet avant de planifier une tâche.")
-            self.notebook.select(self.tab_projects)
-            return
-
-        if day_index is None:
-            day_index = 0
-        if block_index is None:
-            block_index = 0
-
-        week_offset = week_offset_from_monday(self.current_monday)
-        key = (week_offset, day_index, block_index)
-        existing = self.calendar_data.get(key)
-
-        top = self.make_dialog("Attribuer une tâche", "440x470")
-        top.columnconfigure(1, weight=1)
-
-        ttk.Label(top, text="Jour").grid(row=0, column=0, sticky="w", padx=12, pady=8)
-        day_var = tk.StringVar(value=DAYS[day_index])
-        day_cb = ttk.Combobox(top, textvariable=day_var, values=DAYS, state="readonly")
-        day_cb.grid(row=0, column=1, sticky="ew", padx=12, pady=8)
-
-        ttk.Label(top, text="Bloc").grid(row=1, column=0, sticky="w", padx=12, pady=8)
-        block_var = tk.StringVar(value=BLOCK_LABELS[block_index])
-        block_cb = ttk.Combobox(top, textvariable=block_var, values=BLOCK_LABELS, state="readonly")
-        block_cb.grid(row=1, column=1, sticky="ew", padx=12, pady=8)
-
-        ttk.Label(top, text="Employé").grid(row=2, column=0, sticky="w", padx=12, pady=8)
-        user_var = tk.StringVar(value=(existing.get("user") if existing else self.default_user()))
-        user_cb = ttk.Combobox(top, textvariable=user_var, values=sorted(self.users, key=str.lower), state="readonly")
-        user_cb.grid(row=2, column=1, sticky="ew", padx=12, pady=8)
-
-        ttk.Label(top, text="Projet").grid(row=3, column=0, sticky="w", padx=12, pady=8)
-        project_names = [p["name"] for p in sorted(self.projects, key=lambda p: p["name"].lower())]
-        project_var = tk.StringVar(value=(existing.get("project") if existing else project_names[0]))
-        project_cb = ttk.Combobox(top, textvariable=project_var, values=project_names, state="readonly")
-        project_cb.grid(row=3, column=1, sticky="ew", padx=12, pady=8)
-
-        ttk.Label(top, text="Tâche").grid(row=4, column=0, sticky="w", padx=12, pady=8)
-        task_var = tk.StringVar(value=(existing.get("task") if existing else ""))
-        task_cb = ttk.Combobox(top, textvariable=task_var, state="readonly")
-        task_cb.grid(row=4, column=1, sticky="ew", padx=12, pady=8)
-
-        ttk.Label(top, text="Durée").grid(row=5, column=0, sticky="w", padx=12, pady=8)
-        duration_var = tk.StringVar(value="1")
-        duration_spin = ttk.Spinbox(top, from_=1, to=80, textvariable=duration_var, width=6)
-        duration_spin.grid(row=5, column=1, sticky="w", padx=12, pady=8)
-
-        mode_var = tk.StringVar(value="shift")
-        mode_frame = ttk.LabelFrame(top, text="Si des blocs sont déjà occupés")
-        mode_frame.grid(row=6, column=0, columnspan=2, sticky="ew", padx=12, pady=8)
-        ttk.Radiobutton(mode_frame, text="Décaler automatiquement", variable=mode_var, value="shift").pack(anchor="w", padx=10, pady=3)
-        ttk.Radiobutton(mode_frame, text="Écraser les blocs concernés", variable=mode_var, value="overwrite").pack(anchor="w", padx=10, pady=3)
-
-        current_info = ttk.Label(top, text="", anchor="w")
-        current_info.grid(row=7, column=0, columnspan=2, sticky="ew", padx=12, pady=8)
-        if existing:
-            current_info.configure(text=f"Bloc actuel : {existing.get('project')} / {existing.get('task')} / {existing.get('user')}")
-        else:
-            current_info.configure(text="Bloc actuel : libre")
-
-        def refresh_tasks(*_: Any) -> None:
-            project = self.find_project_by_name(project_var.get())
-            tasks = sorted(project.get("tasks", []), key=lambda t: t["name"].lower()) if project else []
-            names = [t["name"] for t in tasks]
-            task_cb["values"] = names
-            if task_var.get() not in names:
-                task_var.set(names[0] if names else "")
-            selected_task = next((t for t in tasks if t["name"] == task_var.get()), None)
-            if selected_task:
-                duration_var.set(str(selected_task.get("duration", 1)))
-
-        def on_task_selected(*_: Any) -> None:
-            project = self.find_project_by_name(project_var.get())
-            if not project:
-                return
-            task = next((t for t in project.get("tasks", []) if t["name"] == task_var.get()), None)
-            if task:
-                duration_var.set(str(task.get("duration", 1)))
-
-        project_cb.bind("<<ComboboxSelected>>", refresh_tasks)
-        task_cb.bind("<<ComboboxSelected>>", on_task_selected)
-        refresh_tasks()
-
-        buttons = ttk.Frame(top)
-        buttons.grid(row=8, column=0, columnspan=2, sticky="ew", padx=12, pady=14)
-
-        def save_assignment() -> None:
-            try:
-                d = DAYS.index(day_var.get())
-                b = BLOCK_LABELS.index(block_var.get())
-                duration = max(1, int(duration_var.get()))
-            except Exception:
-                messagebox.showerror("Erreur", "Jour, bloc ou durée invalide.")
-                return
-            user = user_var.get().strip()
-            project = project_var.get().strip()
-            task = task_var.get().strip()
-            if not user or not project or not task:
-                messagebox.showwarning("Champs manquants", "Sélectionne un employé, un projet et une tâche.")
-                return
-            self.push_history()
-            if mode_var.get() == "overwrite":
-                self.insert_task_overwrite(week_offset, d, b, user, project, task, duration)
-            else:
-                self.insert_task_shift(week_offset, d, b, user, project, task, duration)
-            self.save_all(silent=True)
-            self.refresh_planning()
-            self.set_status(f"Tâche planifiée : {project} / {task} / {user}")
-            top.destroy()
-
-        def delete_current() -> None:
-            d = DAYS.index(day_var.get())
-            b = BLOCK_LABELS.index(block_var.get())
-            k = (week_offset, d, b)
-            if k not in self.calendar_data:
-                top.destroy()
-                return
-            if not messagebox.askyesno("Supprimer", "Supprimer uniquement ce bloc ?"):
-                return
-            self.push_history()
-            del self.calendar_data[k]
-            self.save_all(silent=True)
-            self.refresh_planning()
-            self.set_status("Bloc supprimé")
-            top.destroy()
-
-        ttk.Button(buttons, text="Valider", command=save_assignment).pack(side=LEFT, padx=4)
-        ttk.Button(buttons, text="Supprimer bloc", command=delete_current).pack(side=LEFT, padx=4)
-        ttk.Button(buttons, text="Annuler", command=top.destroy).pack(side=RIGHT, padx=4)
-
-    def insert_task_overwrite(self, week_offset: int, day_index: int, block_index: int, user: str, project: str, task: str, duration: int) -> None:
-        w, d, b = week_offset, day_index, block_index
-        for _ in range(duration):
-            d, b, w = self.normalize_slot(w, d, b)
-            self.calendar_data[(w, d, b)] = {"user": user, "project": project, "task": task}
-            b += 1
-
-    def insert_task_shift(self, week_offset: int, day_index: int, block_index: int, user: str, project: str, task: str, duration: int) -> None:
-        w, d, b = week_offset, day_index, block_index
-        placed = 0
-        while placed < duration:
-            d, b, w = self.normalize_slot(w, d, b)
-            slot_date = (START_DATE + timedelta(days=d + 7 * w)).date()
-            if self.is_user_absent(user, slot_date):
-                b += 1
-                continue
-            if (w, d, b) in self.calendar_data:
-                self.shift_slot_forward(w, d, b)
-            self.calendar_data[(w, d, b)] = {"user": user, "project": project, "task": task}
-            placed += 1
-            b += 1
-
-    def shift_slot_forward(self, week_offset: int, day_index: int, block_index: int) -> None:
-        key = (week_offset, day_index, block_index)
-        if key not in self.calendar_data:
-            return
-        entry = self.calendar_data[key]
-        w, d, b = week_offset, day_index, block_index + 1
-        while True:
-            d, b, w = self.normalize_slot(w, d, b)
-            slot_date = (START_DATE + timedelta(days=d + 7 * w)).date()
-            user = entry.get("user", "")
-            if self.is_user_absent(user, slot_date):
-                b += 1
-                continue
-            next_key = (w, d, b)
-            if next_key in self.calendar_data:
-                self.shift_slot_forward(w, d, b)
-            self.calendar_data[next_key] = entry
-            del self.calendar_data[key]
-            return
-
-    @staticmethod
-    def normalize_slot(week_offset: int, day_index: int, block_index: int) -> Tuple[int, int, int]:
-        w, d, b = week_offset, day_index, block_index
-        while b > 3:
-            b -= 4
-            d += 1
-        while d > 4:
-            d -= 5
-            w += 1
-        while b < 0:
-            b += 4
-            d -= 1
-        while d < 0:
-            d += 5
-            w -= 1
-        return d, b, w
-
-    def clear_current_week(self) -> None:
-        week_offset = week_offset_from_monday(self.current_monday)
-        entries = [k for k in self.calendar_data if k[0] == week_offset]
-        if not entries:
-            messagebox.showinfo("Planning", "La semaine affichée est déjà vide.")
-            return
-        if not messagebox.askyesno("Nettoyer semaine", "Supprimer tous les blocs de la semaine affichée ?"):
-            return
-        self.push_history()
-        for key in entries:
-            del self.calendar_data[key]
-        self.save_all(silent=True)
-        self.refresh_planning()
-        self.set_status("Semaine nettoyée")
-
-    # ------------------------------------------------------------------
-    # Tâches passives
-    # ------------------------------------------------------------------
-
-    def open_passive_dialog(self, edit: bool = False) -> None:
-        selected_task = self.get_selected_passive_task() if edit else None
-        top = self.make_dialog("Modifier tâche passive" if selected_task else "Ajouter tâche passive", "500x420")
-        top.columnconfigure(1, weight=1)
-
-        ttk.Label(top, text="Projet").grid(row=0, column=0, sticky="w", padx=12, pady=8)
-        project_names = [p["name"] for p in sorted(self.projects, key=lambda p: p["name"].lower())]
-        project_var = tk.StringVar(value=selected_task.get("project") if selected_task else (project_names[0] if project_names else ""))
-        project_cb = ttk.Combobox(top, textvariable=project_var, values=project_names, state="readonly")
-        project_cb.grid(row=0, column=1, sticky="ew", padx=12, pady=8)
-
-        ttk.Label(top, text="Tâche").grid(row=1, column=0, sticky="w", padx=12, pady=8)
-        task_var = tk.StringVar(value=selected_task.get("task") if selected_task else "")
-        task_entry = ttk.Entry(top, textvariable=task_var)
-        task_entry.grid(row=1, column=1, sticky="ew", padx=12, pady=8)
-
-        ttk.Label(top, text="Employé").grid(row=2, column=0, sticky="w", padx=12, pady=8)
-        user_var = tk.StringVar(value=selected_task.get("user") if selected_task else self.default_user())
-        user_cb = ttk.Combobox(top, textvariable=user_var, values=sorted(self.users, key=str.lower), state="readonly")
-        user_cb.grid(row=2, column=1, sticky="ew", padx=12, pady=8)
-
-        ttk.Label(top, text="Début").grid(row=3, column=0, sticky="w", padx=12, pady=8)
-        start_var = tk.StringVar(value=selected_task.get("start_date") if selected_task else date.today().isoformat())
-        if TKCALENDAR_AVAILABLE and DateEntry is not None:
-            start_entry = DateEntry(top, date_pattern="yyyy-mm-dd")
-            try:
-                start_entry.set_date(to_date(start_var.get()) or date.today())
-            except Exception:
-                pass
-            start_entry.grid(row=3, column=1, sticky="w", padx=12, pady=8)
-        else:
-            start_entry = ttk.Entry(top, textvariable=start_var)
-            start_entry.grid(row=3, column=1, sticky="ew", padx=12, pady=8)
-
-        ttk.Label(top, text="Durée jours ouvrés").grid(row=4, column=0, sticky="w", padx=12, pady=8)
-        duration_var = tk.StringVar(value=str(selected_task.get("duration", 1)) if selected_task else "1")
-        ttk.Spinbox(top, from_=1, to=365, textvariable=duration_var, width=8).grid(row=4, column=1, sticky="w", padx=12, pady=8)
-
-        ttk.Label(top, text="Note").grid(row=5, column=0, sticky="nw", padx=12, pady=8)
-        note_text = tk.Text(top, height=5, wrap="word")
-        note_text.grid(row=5, column=1, sticky="nsew", padx=12, pady=8)
-        note_text.insert("1.0", selected_task.get("note", "") if selected_task else "")
-
-        buttons = ttk.Frame(top)
-        buttons.grid(row=6, column=0, columnspan=2, sticky="ew", padx=12, pady=12)
-
-        def save_passive() -> None:
-            project = project_var.get().strip()
-            task_name = task_var.get().strip()
-            user = user_var.get().strip()
-            if TKCALENDAR_AVAILABLE and DateEntry is not None and isinstance(start_entry, DateEntry):
-                start = start_entry.get_date().isoformat()
-            else:
-                start = start_var.get().strip()
-            try:
-                duration = max(1, int(duration_var.get()))
-            except Exception:
-                messagebox.showerror("Erreur", "Durée invalide.")
-                return
-            if not project or not task_name or not to_date(start):
-                messagebox.showwarning("Champs invalides", "Projet, tâche et date de début sont obligatoires.")
-                return
-            self.push_history()
-            payload = {
-                "id": selected_task.get("id") if selected_task else uuid.uuid4().hex,
-                "project": project,
-                "task": task_name,
-                "user": user,
-                "start_date": start,
-                "duration": duration,
-                "note": note_text.get("1.0", "end").strip(),
-            }
-            if selected_task:
-                index = next((i for i, t in enumerate(self.passive_tasks) if t["id"] == selected_task["id"]), None)
-                if index is not None:
-                    self.passive_tasks[index] = payload
-            else:
-                self.passive_tasks.append(payload)
-            self.save_all(silent=True)
-            self.refresh_passive_tree()
-            self.set_status("Tâche passive sauvegardée")
-            top.destroy()
-
-        ttk.Button(buttons, text="Valider", command=save_passive).pack(side=LEFT, padx=4)
-        ttk.Button(buttons, text="Annuler", command=top.destroy).pack(side=RIGHT, padx=4)
-
-    def get_selected_passive_task(self) -> Optional[Dict[str, Any]]:
-        if not self.passive_tree:
+    def selected_task(self) -> Optional[Dict[str, Any]]:
+        project = self.selected_project()
+        selection = self.task_tree.selection()
+        if not project or not selection:
             return None
-        sel = self.passive_tree.selection()
-        if not sel:
-            return None
-        task_id = sel[0]
-        return next((t for t in self.passive_tasks if t.get("id") == task_id), None)
+        return self.store.find_task(project["id"], selection[0])
 
-    def delete_selected_passive_task(self) -> None:
-        task = self.get_selected_passive_task()
-        if not task:
-            messagebox.showinfo("Tâches passives", "Sélectionne une tâche passive.")
-            return
-        if not messagebox.askyesno("Supprimer", f"Supprimer la tâche passive :\n{task.get('project')} / {task.get('task')} ?"):
-            return
-        self.push_history()
-        self.passive_tasks = [t for t in self.passive_tasks if t.get("id") != task.get("id")]
-        self.save_all(silent=True)
-        self.refresh_passive_tree()
-        self.set_status("Tâche passive supprimée")
+    def on_project_selected(self) -> None:
+        selection = self.project_tree.selection()
+        self.selected_project_id = selection[0] if selection else None
+        self.refresh_task_tree()
 
-    def convert_passive_to_calendar(self) -> None:
-        task = self.get_selected_passive_task()
-        if not task:
-            messagebox.showinfo("Tâches passives", "Sélectionne une tâche passive à convertir.")
-            return
-        start = to_date(task.get("start_date", "")) or date.today()
-        self.current_monday = datetime.combine(monday_of(start), datetime.min.time())
-        day_index = start.weekday() if start.weekday() < 5 else 0
-        self.push_history()
-        # Ici on convertit jours ouvrés en blocs de 4/jour.
-        duration_blocks = max(1, int(task.get("duration", 1))) * 4
-        self.insert_task_shift(
-            week_offset_from_monday(self.current_monday),
-            day_index,
-            0,
-            task.get("user", ""),
-            task.get("project", ""),
-            task.get("task", ""),
-            duration_blocks,
-        )
-        self.passive_tasks = [t for t in self.passive_tasks if t.get("id") != task.get("id")]
-        self.save_all(silent=True)
-        self.notebook.select(self.tab_planning)
-        self.refresh_all()
-        self.set_status("Tâche passive convertie en planning")
+    def add_user(self) -> None:
+        self.open_user_dialog()
 
-    # ------------------------------------------------------------------
-    # Employés
-    # ------------------------------------------------------------------
-
-    def add_employee_dialog(self) -> None:
-        name = self.ask_text("Ajouter employé", "Nom de l'employé :")
-        if not name:
-            return
-        if name in self.users:
-            messagebox.showwarning("Doublon", "Cet employé existe déjà.")
-            return
-        self.push_history()
-        self.users.append(name)
-        self.users = sorted(self.users, key=str.lower)
-        self.user_constraints[name] = {"weekly_pattern": [1, 1, 1, 1, 1], "holidays": []}
-        self.save_all(silent=True)
-        self.refresh_all()
-        self.set_status(f"Employé ajouté : {name}")
-
-    def selected_employee(self) -> Optional[str]:
-        if not self.employee_tree:
-            return None
-        sel = self.employee_tree.selection()
-        return sel[0] if sel else None
-
-    def rename_employee_dialog(self) -> None:
-        old = self.selected_employee()
-        if not old:
-            messagebox.showinfo("Employés", "Sélectionne un employé.")
-            return
-        new = self.ask_text("Renommer employé", "Nouveau nom :", old)
-        if not new or new == old:
-            return
-        if new in self.users:
-            messagebox.showwarning("Doublon", "Ce nom existe déjà.")
-            return
-        self.push_history()
-        self.users = [new if u == old else u for u in self.users]
-        self.user_constraints[new] = self.user_constraints.pop(old, {"weekly_pattern": [1, 1, 1, 1, 1], "holidays": []})
-        for entry in self.calendar_data.values():
-            if entry.get("user") == old:
-                entry["user"] = new
-        for task in self.passive_tasks:
-            if task.get("user") == old:
-                task["user"] = new
-        self.save_all(silent=True)
-        self.refresh_all()
-        self.set_status(f"Employé renommé : {old} → {new}")
-
-    def delete_employee(self) -> None:
-        user = self.selected_employee()
+    def edit_user(self) -> None:
+        user = self.selected_user()
         if not user:
-            messagebox.showinfo("Employés", "Sélectionne un employé.")
+            messagebox.showinfo("Utilisateur", "Selectionne un utilisateur.")
             return
-        used = any(e.get("user") == user for e in self.calendar_data.values()) or any(t.get("user") == user for t in self.passive_tasks)
-        msg = f"Supprimer l'employé '{user}' ?"
-        if used:
-            msg += "\n\nAttention : ses blocs déjà planifiés resteront visibles mais l'employé sera retiré de la liste."
-        if not messagebox.askyesno("Supprimer employé", msg):
-            return
-        self.push_history()
-        self.users = [u for u in self.users if u != user]
-        self.user_constraints.pop(user, None)
-        self.save_all(silent=True)
-        self.refresh_all()
-        self.set_status(f"Employé supprimé : {user}")
+        self.open_user_dialog(user)
 
-    def edit_employee_constraints(self) -> None:
-        user = self.selected_employee()
-        if not user:
-            messagebox.showinfo("Employés", "Sélectionne un employé.")
-            return
-        constraints = self.user_constraints.setdefault(user, {"weekly_pattern": [1, 1, 1, 1, 1], "holidays": []})
-        top = self.make_dialog(f"Disponibilités — {user}", "560x440")
-        top.columnconfigure(0, weight=1)
-        pattern = list(constraints.get("weekly_pattern", [1, 1, 1, 1, 1]))[:5]
-        vars_days = []
+    def open_user_dialog(self, user: Optional[Dict[str, Any]] = None) -> None:
+        dialog = self.dialog("Utilisateur", "560x560")
+        dialog.columnconfigure(1, weight=1)
+        ttk.Label(dialog, text="Nom").grid(row=0, column=0, sticky="w", padx=12, pady=8)
+        name_var = tk.StringVar(value=user.get("name", "") if user else "")
+        ttk.Entry(dialog, textvariable=name_var).grid(row=0, column=1, sticky="ew", padx=12, pady=8)
 
-        ttk.Label(top, text="Jours travaillés habituellement", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(12, 6))
-        day_frame = ttk.Frame(top)
-        day_frame.pack(fill=X, padx=12, pady=4)
+        weekly_vars = []
+        ttk.Label(dialog, text="Capacite par jour").grid(row=1, column=0, sticky="nw", padx=12, pady=8)
+        weekly_frame = ttk.Frame(dialog)
+        weekly_frame.grid(row=1, column=1, sticky="ew", padx=12, pady=8)
+        weekly = user.get("weekly_capacity", [SLOTS_PER_DAY] * 5) if user else [SLOTS_PER_DAY] * 5
         for i, day_name in enumerate(DAYS):
-            var = tk.IntVar(value=int(pattern[i]))
-            vars_days.append(var)
-            ttk.Checkbutton(day_frame, text=day_name, variable=var).pack(side=LEFT, padx=8)
+            var = tk.StringVar(value=str(weekly[i]))
+            weekly_vars.append(var)
+            ttk.Label(weekly_frame, text=day_name).grid(row=i, column=0, sticky="w", pady=2)
+            ttk.Spinbox(weekly_frame, from_=0, to=SLOTS_PER_DAY, textvariable=var, width=5).grid(row=i, column=1, sticky="w", padx=8, pady=2)
+            ttk.Label(weekly_frame, text=f"creneaux ({duration_label(clamp_int(var.get(), 0, SLOTS_PER_DAY, SLOTS_PER_DAY))})").grid(row=i, column=2, sticky="w", pady=2)
 
-        ttk.Label(top, text="Absences spécifiques YYYY-MM-DD", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(16, 6))
-        list_frame = ttk.Frame(top)
-        list_frame.pack(fill=BOTH, expand=True, padx=12, pady=4)
-        holiday_list = tk.Listbox(list_frame, height=8)
-        holiday_list.pack(side=LEFT, fill=BOTH, expand=True)
-        sb = ttk.Scrollbar(list_frame, orient=VERTICAL, command=holiday_list.yview)
-        sb.pack(side=RIGHT, fill=Y)
-        holiday_list.configure(yscrollcommand=sb.set)
-        for h in constraints.get("holidays", []):
-            holiday_list.insert(END, h)
+        ttk.Label(dialog, text="Jours speciaux").grid(row=2, column=0, sticky="nw", padx=12, pady=8)
+        special_frame = ttk.Frame(dialog)
+        special_frame.grid(row=2, column=1, sticky="nsew", padx=12, pady=8)
+        special_list = tk.Listbox(special_frame, height=8)
+        special_list.grid(row=0, column=0, columnspan=4, sticky="nsew")
+        special_scroll = ttk.Scrollbar(special_frame, orient=tk.VERTICAL, command=special_list.yview)
+        special_scroll.grid(row=0, column=4, sticky="ns")
+        special_list.configure(yscrollcommand=special_scroll.set)
+        special_days: Dict[str, int] = dict(user.get("special_days", {})) if user else {}
 
-        add_frame = ttk.Frame(top)
-        add_frame.pack(fill=X, padx=12, pady=8)
+        def redraw_special() -> None:
+            special_list.delete(0, tk.END)
+            for day_key, slots in sorted(special_days.items()):
+                special_list.insert(tk.END, f"{day_key} = {slots} creneau(x) ({duration_label(slots)})")
+
         date_var = tk.StringVar(value=date.today().isoformat())
-        ttk.Entry(add_frame, textvariable=date_var, width=14).pack(side=LEFT, padx=4)
+        slots_var = tk.StringVar(value="0")
+        ttk.Entry(special_frame, textvariable=date_var, width=12).grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Spinbox(special_frame, from_=0, to=SLOTS_PER_DAY, textvariable=slots_var, width=5).grid(row=1, column=1, sticky="w", padx=6, pady=6)
 
-        def add_holiday() -> None:
-            value = date_var.get().strip()
-            if not to_date(value):
-                messagebox.showerror("Date invalide", "Format attendu : YYYY-MM-DD")
+        def add_special() -> None:
+            parsed = parse_date(date_var.get())
+            if not parsed:
+                messagebox.showerror("Date invalide", "Format attendu: YYYY-MM-DD.")
                 return
-            current = list(holiday_list.get(0, END))
-            if value not in current:
-                holiday_list.insert(END, value)
+            special_days[parsed.isoformat()] = clamp_int(slots_var.get(), 0, SLOTS_PER_DAY, 0)
+            redraw_special()
 
-        def remove_holiday() -> None:
-            sel = holiday_list.curselection()
-            if sel:
-                holiday_list.delete(sel[0])
+        def remove_special() -> None:
+            selection = special_list.curselection()
+            if not selection:
+                return
+            key = special_list.get(selection[0]).split(" = ", 1)[0]
+            special_days.pop(key, None)
+            redraw_special()
 
-        ttk.Button(add_frame, text="Ajouter absence", command=add_holiday).pack(side=LEFT, padx=4)
-        ttk.Button(add_frame, text="Supprimer sélection", command=remove_holiday).pack(side=LEFT, padx=4)
+        ttk.Button(special_frame, text="Ajouter", command=add_special).grid(row=1, column=2, padx=3, pady=6)
+        ttk.Button(special_frame, text="Supprimer", command=remove_special).grid(row=1, column=3, padx=3, pady=6)
+        redraw_special()
 
-        buttons = ttk.Frame(top)
-        buttons.pack(fill=X, padx=12, pady=12)
+        ttk.Label(dialog, text="Note").grid(row=3, column=0, sticky="nw", padx=12, pady=8)
+        note_var = tk.StringVar(value=user.get("note", "") if user else "")
+        ttk.Entry(dialog, textvariable=note_var).grid(row=3, column=1, sticky="ew", padx=12, pady=8)
 
-        def save_constraints() -> None:
-            self.push_history()
-            self.user_constraints[user] = {
-                "weekly_pattern": [v.get() for v in vars_days],
-                "holidays": sorted(set(holiday_list.get(0, END))),
-            }
-            self.save_all(silent=True)
-            self.refresh_all()
-            self.set_status(f"Disponibilités sauvegardées : {user}")
-            top.destroy()
+        buttons = ttk.Frame(dialog)
+        buttons.grid(row=4, column=0, columnspan=2, sticky="ew", padx=12, pady=16)
 
-        ttk.Button(buttons, text="Valider", command=save_constraints).pack(side=LEFT, padx=4)
-        ttk.Button(buttons, text="Annuler", command=top.destroy).pack(side=RIGHT, padx=4)
+        def save() -> None:
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showerror("Utilisateur", "Le nom est obligatoire.")
+                return
+            duplicate = next((item for item in self.store.users if item["name"].lower() == name.lower() and item is not user), None)
+            if duplicate:
+                messagebox.showerror("Utilisateur", "Ce nom existe deja.")
+                return
+            target = user or {"id": new_id()}
+            target.update(
+                {
+                    "name": name,
+                    "weekly_capacity": [clamp_int(var.get(), 0, SLOTS_PER_DAY, SLOTS_PER_DAY) for var in weekly_vars],
+                    "special_days": dict(sorted(special_days.items())),
+                    "note": note_var.get().strip(),
+                }
+            )
+            if user is None:
+                self.store.users.append(target)
+            self.after_data_change("Utilisateur sauvegarde")
+            dialog.destroy()
 
-    # ------------------------------------------------------------------
-    # Projets / tâches
-    # ------------------------------------------------------------------
+        ttk.Button(buttons, text="Valider", command=save).pack(side=tk.LEFT, padx=4)
+        ttk.Button(buttons, text="Annuler", command=dialog.destroy).pack(side=tk.RIGHT, padx=4)
 
-    def add_project_dialog(self) -> None:
-        name = self.ask_text("Ajouter projet", "Nom du projet :")
-        if not name:
+    def delete_user(self) -> None:
+        user = self.selected_user()
+        if not user:
+            messagebox.showinfo("Utilisateur", "Selectionne un utilisateur.")
             return
-        if self.find_project_by_name(name):
-            messagebox.showwarning("Doublon", "Ce projet existe déjà.")
+        if not messagebox.askyesno("Supprimer", f"Supprimer {user['name']} ?"):
             return
-        color = colorchooser.askcolor(title="Couleur du projet")[1] or DEFAULT_PROJECT_COLOR
-        self.push_history()
-        self.projects.append({"id": uuid.uuid4().hex, "name": name, "tasks": [], "color": safe_color(color, DEFAULT_PROJECT_COLOR)})
-        self.save_all(silent=True)
-        self.refresh_all()
-        self.set_status(f"Projet ajouté : {name}")
+        self.store.users = [item for item in self.store.users if item["id"] != user["id"]]
+        for project in self.store.projects:
+            for task in project.get("tasks", []):
+                if task.get("assignee_id") == user["id"]:
+                    task["assignee_id"] = ""
+        self.after_data_change("Utilisateur supprime")
 
-    def rename_project_dialog(self) -> None:
-        project = self.get_selected_project()
+    def add_project(self) -> None:
+        self.open_project_dialog()
+
+    def edit_project(self) -> None:
+        project = self.selected_project()
         if not project:
-            messagebox.showinfo("Projets", "Sélectionne un projet.")
+            messagebox.showinfo("Etude", "Selectionne une etude.")
             return
-        old = project["name"]
-        new = self.ask_text("Renommer projet", "Nouveau nom :", old)
-        if not new or new == old:
-            return
-        if self.find_project_by_name(new):
-            messagebox.showwarning("Doublon", "Ce projet existe déjà.")
-            return
-        self.push_history()
-        project["name"] = new
-        for entry in self.calendar_data.values():
-            if entry.get("project") == old:
-                entry["project"] = new
-        for task in self.passive_tasks:
-            if task.get("project") == old:
-                task["project"] = new
-        self.save_all(silent=True)
-        self.refresh_all()
-        self.set_status(f"Projet renommé : {old} → {new}")
+        self.open_project_dialog(project)
 
-    def choose_project_color(self) -> None:
-        project = self.get_selected_project()
-        if not project:
-            messagebox.showinfo("Projets", "Sélectionne un projet.")
-            return
-        color = colorchooser.askcolor(title=f"Couleur — {project['name']}")[1]
-        if not color:
-            return
-        self.push_history()
-        project["color"] = color
-        self.save_all(silent=True)
-        self.refresh_all()
-        self.set_status("Couleur projet mise à jour")
+    def open_project_dialog(self, project: Optional[Dict[str, Any]] = None) -> None:
+        dialog = self.dialog("Etude", "420x180")
+        dialog.columnconfigure(1, weight=1)
+        ttk.Label(dialog, text="Nom").grid(row=0, column=0, sticky="w", padx=12, pady=12)
+        name_var = tk.StringVar(value=project.get("name", "") if project else "")
+        ttk.Entry(dialog, textvariable=name_var).grid(row=0, column=1, sticky="ew", padx=12, pady=12)
+        buttons = ttk.Frame(dialog)
+        buttons.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=12)
+
+        def save() -> None:
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showerror("Etude", "Le nom est obligatoire.")
+                return
+            duplicate = next((item for item in self.store.projects if item["name"].lower() == name.lower() and item is not project), None)
+            if duplicate:
+                messagebox.showerror("Etude", "Cette etude existe deja.")
+                return
+            target = project or {"id": new_id(), "tasks": [], "color": "#dbeafe"}
+            target["name"] = name
+            if project is None:
+                self.store.projects.append(target)
+                self.selected_project_id = target["id"]
+            self.after_data_change("Etude sauvegardee")
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Valider", command=save).pack(side=tk.LEFT, padx=4)
+        ttk.Button(buttons, text="Annuler", command=dialog.destroy).pack(side=tk.RIGHT, padx=4)
 
     def delete_project(self) -> None:
-        project = self.get_selected_project()
+        project = self.selected_project()
         if not project:
-            messagebox.showinfo("Projets", "Sélectionne un projet.")
+            messagebox.showinfo("Etude", "Selectionne une etude.")
             return
-        name = project["name"]
-        used = any(e.get("project") == name for e in self.calendar_data.values()) or any(t.get("project") == name for t in self.passive_tasks)
-        msg = f"Supprimer le projet '{name}' ?"
-        if used:
-            msg += "\n\nLes blocs/tâches passives liés à ce projet seront aussi supprimés."
-        if not messagebox.askyesno("Supprimer projet", msg):
+        if not messagebox.askyesno("Supprimer", f"Supprimer l'etude {project['name']} et ses taches ?"):
             return
-        self.push_history()
-        self.projects = [p for p in self.projects if p.get("id") != project.get("id")]
-        self.calendar_data = {k: v for k, v in self.calendar_data.items() if v.get("project") != name}
-        self.passive_tasks = [t for t in self.passive_tasks if t.get("project") != name]
+        self.store.projects = [item for item in self.store.projects if item["id"] != project["id"]]
         self.selected_project_id = None
-        self.save_all(silent=True)
-        self.refresh_all()
-        self.set_status(f"Projet supprimé : {name}")
+        self.after_data_change("Etude supprimee")
 
-    def add_task_dialog(self) -> None:
-        project = self.get_selected_project()
+    def add_task(self) -> None:
+        project = self.selected_project()
         if not project:
-            messagebox.showinfo("Projets", "Sélectionne un projet.")
+            messagebox.showinfo("Tache", "Cree ou selectionne une etude.")
             return
-        self.open_task_editor(project)
+        self.open_task_dialog(project)
 
-    def edit_task_dialog(self) -> None:
-        project = self.get_selected_project()
-        task = self.get_selected_task(project) if project else None
+    def edit_task(self) -> None:
+        project = self.selected_project()
+        task = self.selected_task()
         if not project or not task:
-            messagebox.showinfo("Tâches", "Sélectionne une tâche.")
+            messagebox.showinfo("Tache", "Selectionne une tache.")
             return
-        self.open_task_editor(project, task)
+        self.open_task_dialog(project, task)
 
-    def open_task_editor(self, project: Dict[str, Any], task: Optional[Dict[str, Any]] = None) -> None:
-        top = self.make_dialog("Modifier tâche" if task else "Ajouter tâche", "360x220")
-        top.columnconfigure(1, weight=1)
-        ttk.Label(top, text="Nom").grid(row=0, column=0, sticky="w", padx=12, pady=10)
-        name_var = tk.StringVar(value=task.get("name") if task else "")
-        ttk.Entry(top, textvariable=name_var).grid(row=0, column=1, sticky="ew", padx=12, pady=10)
-        ttk.Label(top, text="Durée blocs").grid(row=1, column=0, sticky="w", padx=12, pady=10)
-        duration_var = tk.StringVar(value=str(task.get("duration", 1)) if task else "1")
-        ttk.Spinbox(top, from_=1, to=80, textvariable=duration_var, width=8).grid(row=1, column=1, sticky="w", padx=12, pady=10)
+    def open_task_dialog(self, project: Dict[str, Any], task: Optional[Dict[str, Any]] = None) -> None:
+        dialog = self.dialog("Tache", "520x360")
+        dialog.columnconfigure(1, weight=1)
+        ttk.Label(dialog, text="Nom").grid(row=0, column=0, sticky="w", padx=12, pady=8)
+        name_var = tk.StringVar(value=task.get("name", "") if task else "")
+        ttk.Entry(dialog, textvariable=name_var).grid(row=0, column=1, sticky="ew", padx=12, pady=8)
 
-        def save_task() -> None:
+        ttk.Label(dialog, text="Duree (creneaux de 30 min)").grid(row=1, column=0, sticky="w", padx=12, pady=8)
+        duration_var = tk.StringVar(value=str(task.get("duration_slots", 1)) if task else "1")
+        ttk.Spinbox(dialog, from_=1, to=500, textvariable=duration_var, width=8).grid(row=1, column=1, sticky="w", padx=12, pady=8)
+
+        ttk.Label(dialog, text="Priorite").grid(row=2, column=0, sticky="w", padx=12, pady=8)
+        priority_var = tk.StringVar(value=str(task.get("priority", 2)) if task else "2")
+        ttk.Spinbox(dialog, from_=0, to=5, textvariable=priority_var, width=8).grid(row=2, column=1, sticky="w", padx=12, pady=8)
+
+        ttk.Label(dialog, text="Utilisateur").grid(row=3, column=0, sticky="w", padx=12, pady=8)
+        user_options = ["Auto"] + [user["name"] for user in self.store.users]
+        current_user = self.store.user_name(task.get("assignee_id", "")) if task else "Auto"
+        assignee_var = tk.StringVar(value=current_user or "Auto")
+        ttk.Combobox(dialog, textvariable=assignee_var, values=user_options, state="readonly").grid(row=3, column=1, sticky="ew", padx=12, pady=8)
+
+        ttk.Label(dialog, text="Statut").grid(row=4, column=0, sticky="w", padx=12, pady=8)
+        status_var = tk.StringVar(value=task.get("status", "a_planifier") if task else "a_planifier")
+        ttk.Combobox(dialog, textvariable=status_var, values=STATUSES, state="readonly").grid(row=4, column=1, sticky="ew", padx=12, pady=8)
+
+        ttk.Label(dialog, text="Note").grid(row=5, column=0, sticky="w", padx=12, pady=8)
+        note_var = tk.StringVar(value=task.get("note", "") if task else "")
+        ttk.Entry(dialog, textvariable=note_var).grid(row=5, column=1, sticky="ew", padx=12, pady=8)
+
+        buttons = ttk.Frame(dialog)
+        buttons.grid(row=6, column=0, columnspan=2, sticky="ew", padx=12, pady=16)
+
+        def save() -> None:
             name = name_var.get().strip()
-            try:
-                duration = max(1, int(duration_var.get()))
-            except Exception:
-                messagebox.showerror("Erreur", "Durée invalide.")
-                return
             if not name:
-                messagebox.showwarning("Nom manquant", "Le nom de tâche est obligatoire.")
+                messagebox.showerror("Tache", "Le nom est obligatoire.")
                 return
-            if task is None and any(t["name"].lower() == name.lower() for t in project.get("tasks", [])):
-                messagebox.showwarning("Doublon", "Cette tâche existe déjà dans le projet.")
-                return
-            self.push_history()
-            if task:
-                old_name = task["name"]
-                task["name"] = name
-                task["duration"] = duration
-                for entry in self.calendar_data.values():
-                    if entry.get("project") == project["name"] and entry.get("task") == old_name:
-                        entry["task"] = name
-                for passive in self.passive_tasks:
-                    if passive.get("project") == project["name"] and passive.get("task") == old_name:
-                        passive["task"] = name
-            else:
-                project.setdefault("tasks", []).append({"name": name, "duration": duration})
-            project["tasks"] = sorted(project.get("tasks", []), key=lambda t: t["name"].lower())
-            self.save_all(silent=True)
-            self.refresh_all()
-            self.set_status("Tâche sauvegardée")
-            top.destroy()
+            assignee_id = ""
+            if assignee_var.get() != "Auto":
+                assignee = next((user for user in self.store.users if user["name"] == assignee_var.get()), None)
+                assignee_id = assignee["id"] if assignee else ""
+            target = task or {"id": new_id()}
+            target.update(
+                {
+                    "name": name,
+                    "duration_slots": clamp_int(duration_var.get(), 1, 500, 1),
+                    "priority": clamp_int(priority_var.get(), 0, 5, 2),
+                    "assignee_id": assignee_id,
+                    "status": status_var.get(),
+                    "note": note_var.get().strip(),
+                }
+            )
+            if task is None:
+                project.setdefault("tasks", []).append(target)
+            self.after_data_change("Tache sauvegardee")
+            dialog.destroy()
 
-        buttons = ttk.Frame(top)
-        buttons.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=16)
-        ttk.Button(buttons, text="Valider", command=save_task).pack(side=LEFT, padx=4)
-        ttk.Button(buttons, text="Annuler", command=top.destroy).pack(side=RIGHT, padx=4)
+        ttk.Button(buttons, text="Valider", command=save).pack(side=tk.LEFT, padx=4)
+        ttk.Button(buttons, text="Annuler", command=dialog.destroy).pack(side=tk.RIGHT, padx=4)
 
     def delete_task(self) -> None:
-        project = self.get_selected_project()
-        task = self.get_selected_task(project) if project else None
+        project = self.selected_project()
+        task = self.selected_task()
         if not project or not task:
-            messagebox.showinfo("Tâches", "Sélectionne une tâche.")
+            messagebox.showinfo("Tache", "Selectionne une tache.")
             return
-        if not messagebox.askyesno("Supprimer tâche", f"Supprimer la tâche '{task['name']}' du projet '{project['name']}' ?"):
+        if not messagebox.askyesno("Supprimer", f"Supprimer la tache {task['name']} ?"):
             return
-        self.push_history()
-        task_name = task["name"]
-        project["tasks"] = [t for t in project.get("tasks", []) if t["name"] != task_name]
-        # On ne supprime pas les blocs déjà planifiés : ils restent comme historique visuel.
-        self.save_all(silent=True)
+        project["tasks"] = [item for item in project.get("tasks", []) if item["id"] != task["id"]]
+        self.after_data_change("Tache supprimee")
+
+    def selected_assignment(self) -> Optional[Dict[str, Any]]:
+        selection = self.schedule_tree.selection()
+        if not selection:
+            return None
+        return next((row for row in self.store.assignments if row.get("id") == selection[0]), None)
+
+    def mark_selected_task_done(self) -> None:
+        row = self.selected_assignment()
+        if not row:
+            messagebox.showinfo("Planning", "Selectionne une ligne du planning.")
+            return
+        task = self.store.find_task(row["project_id"], row["task_id"])
+        if task:
+            task["status"] = "termine"
+            self.after_data_change("Tache terminee")
+
+    def mark_selected_task_urgent(self) -> None:
+        row = self.selected_assignment()
+        if not row:
+            messagebox.showinfo("Planning", "Selectionne une ligne du planning.")
+            return
+        task = self.store.find_task(row["project_id"], row["task_id"])
+        if task:
+            task["priority"] = 5
+            task["status"] = "a_planifier"
+            self.after_data_change("Tache mise en urgent")
+
+    def focus_selected_task(self) -> None:
+        row = self.selected_assignment()
+        if not row:
+            messagebox.showinfo("Planning", "Selectionne une ligne du planning.")
+            return
+        self.notebook.select(self.tab_projects)
+        self.selected_project_id = row["project_id"]
+        self.refresh_project_tree()
+        self.project_tree.selection_set(row["project_id"])
+        self.task_tree.selection_set(row["task_id"])
+        self.task_tree.focus(row["task_id"])
+
+    def after_data_change(self, status: str) -> None:
+        self.store.normalize()
+        self.store.save()
+        self.recalculate_schedule(silent=True)
         self.refresh_all()
-        self.set_status("Tâche supprimée")
+        self.set_status(status)
 
-    # ------------------------------------------------------------------
-    # Undo / redo
-    # ------------------------------------------------------------------
-
-    def undo(self) -> None:
-        if not self.history:
-            messagebox.showinfo("Annuler", "Aucune action à annuler.")
-            return
-        self.redo_history.append(self.snapshot())
-        snap = self.history.pop()
-        self.restore_snapshot(snap)
-        self.set_status("Action annulée")
-
-    def redo(self) -> None:
-        if not self.redo_history:
-            messagebox.showinfo("Rétablir", "Aucune action à rétablir.")
-            return
-        self.history.append(self.snapshot())
-        snap = self.redo_history.pop()
-        self.restore_snapshot(snap)
-        self.set_status("Action rétablie")
-
-    # ------------------------------------------------------------------
-    # Helpers métier
-    # ------------------------------------------------------------------
-
-    def is_user_absent(self, user: str, day: date) -> bool:
-        constraints = self.user_constraints.get(user)
-        if not constraints:
-            return False
-        if day.weekday() >= 5:
-            return True
-        pattern = constraints.get("weekly_pattern", [1, 1, 1, 1, 1])
-        try:
-            if int(pattern[day.weekday()]) == 0:
-                return True
-        except Exception:
-            pass
-        return day.isoformat() in constraints.get("holidays", [])
-
-    def default_user(self) -> str:
-        filter_user = self.filter_user_var.get()
-        if filter_user != "Tous" and filter_user in self.users:
-            return filter_user
-        return sorted(self.users, key=str.lower)[0] if self.users else ""
-
-    def find_project_by_id(self, project_id: Optional[str]) -> Optional[Dict[str, Any]]:
-        if not project_id:
-            return None
-        return next((p for p in self.projects if p.get("id") == project_id), None)
-
-    def find_project_by_name(self, name: str) -> Optional[Dict[str, Any]]:
-        return next((p for p in self.projects if p.get("name") == name), None)
-
-    def get_selected_project(self) -> Optional[Dict[str, Any]]:
-        if not self.project_tree:
-            return None
-        sel = self.project_tree.selection()
-        if sel:
-            self.selected_project_id = sel[0]
-        return self.find_project_by_id(self.selected_project_id)
-
-    def get_selected_task(self, project: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        if not project or not self.task_tree:
-            return None
-        sel = self.task_tree.selection()
-        if not sel:
-            return None
-        values = self.task_tree.item(sel[0], "values")
-        if not values:
-            return None
-        task_name = values[0]
-        return next((t for t in project.get("tasks", []) if t.get("name") == task_name), None)
-
-    # ------------------------------------------------------------------
-    # Mini-dialogues
-    # ------------------------------------------------------------------
-
-    def make_dialog(self, title: str, geometry: str) -> tk.Toplevel:
-        top = tk.Toplevel(self.root)
-        top.title(title)
-        top.geometry(geometry)
-        top.transient(self.root)
-        top.grab_set()
-        top.focus_force()
-        return top
-
-    def ask_text(self, title: str, label: str, initial: str = "") -> Optional[str]:
-        top = self.make_dialog(title, "380x160")
-        top.columnconfigure(0, weight=1)
-        ttk.Label(top, text=label).grid(row=0, column=0, sticky="w", padx=12, pady=(14, 6))
-        var = tk.StringVar(value=initial)
-        entry = ttk.Entry(top, textvariable=var)
-        entry.grid(row=1, column=0, sticky="ew", padx=12, pady=6)
-        entry.focus_set()
-        result: Dict[str, Optional[str]] = {"value": None}
-
-        def validate(*_: Any) -> None:
-            value = var.get().strip()
-            result["value"] = value if value else None
-            top.destroy()
-
-        def cancel() -> None:
-            result["value"] = None
-            top.destroy()
-
-        buttons = ttk.Frame(top)
-        buttons.grid(row=2, column=0, sticky="ew", padx=12, pady=12)
-        ttk.Button(buttons, text="Valider", command=validate).pack(side=LEFT, padx=4)
-        ttk.Button(buttons, text="Annuler", command=cancel).pack(side=RIGHT, padx=4)
-        top.bind("<Return>", validate)
-        top.bind("<Escape>", lambda e: cancel())
-        self.root.wait_window(top)
-        return result["value"]
+    def dialog(self, title: str, geometry: str) -> tk.Toplevel:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.geometry(geometry)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.focus_force()
+        return dialog
 
 
 if __name__ == "__main__":
