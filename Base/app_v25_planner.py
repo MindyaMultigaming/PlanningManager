@@ -31,7 +31,7 @@ SLOT_MINUTES = 30
 SLOTS_PER_DAY = 17
 WORKDAY_START = time(8, 30)
 DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi"]
-STATUSES = ["a_planifier", "en_cours", "termine"]
+STATUSES = ["a_planifier", "planifie", "en_cours", "termine"]
 FREE_COLOR = "#f8fafc"
 TASK_COLOR = "#dbeafe"
 URGENT_COLOR = "#fde68a"
@@ -390,11 +390,26 @@ class PlannerStore:
         assignments: List[Dict[str, Any]] = []
         unscheduled: List[Dict[str, Any]] = []
         summary: Dict[str, int] = {user["id"]: 0 for user in self.users}
+        for row in self.assignments if isinstance(self.assignments, list) else []:
+            project_id = str(row.get("project_id", ""))
+            task_id = str(row.get("task_id", ""))
+            task = self.find_task(project_id, task_id)
+            user = self.find_user(str(row.get("user_id", "")))
+            if not task or not user or task.get("status") in ("a_planifier", "termine"):
+                continue
+            if not self.assignment_is_still_available(row, user, occupied):
+                task["status"] = "a_planifier"
+                task["manual_start"] = {}
+                continue
+            assignments.append(row)
+            for slot in range(int(row.get("slot_index", 0)), min(SLOTS_PER_DAY, int(row.get("slot_index", 0)) + int(row.get("duration_slots", 1)))):
+                occupied[(user["id"], row["date"], slot)] = {"project_id": project_id, "task_id": task_id}
+            summary[user["id"]] = summary.get(user["id"], 0) + int(row.get("duration_slots", 1))
 
         tasks = []
         for project in self.projects:
             for task in project.get("tasks", []):
-                if task.get("status") == "termine":
+                if task.get("status") != "a_planifier":
                     continue
                 tasks.append({"project": project, "task": task})
         tasks.sort(key=self._schedule_sort_key)
@@ -437,11 +452,52 @@ class PlannerStore:
                 occupied[(best_user["id"], day.isoformat(), slot)] = {"project_id": project["id"], "task_id": task["id"]}
             summary[best_user["id"]] = summary.get(best_user["id"], 0) + len(best_slots)
             assignments.extend(self._group_slots(project, task, best_user, best_slots))
+            task["status"] = "planifie"
 
         assignments.sort(key=lambda row: (row["date"], row["slot_index"], row["user_name"], row["project_name"], row["task_name"]))
         self.assignments = assignments
         self.save()
         return ScheduleResult(assignments=assignments, unscheduled=unscheduled, summary=summary)
+
+    def assignment_is_still_available(
+        self,
+        row: Dict[str, Any],
+        user: Dict[str, Any],
+        occupied: Dict[Tuple[str, str, int], Dict[str, Any]],
+    ) -> bool:
+        day = parse_date(str(row.get("date", "")))
+        if not day:
+            return False
+        start_slot = int(row.get("slot_index", 0))
+        duration = int(row.get("duration_slots", 1))
+        for slot in range(start_slot, min(SLOTS_PER_DAY, start_slot + duration)):
+            key = (user["id"], row["date"], slot)
+            if key in occupied or not self.is_work_slot(user, day, slot):
+                return False
+        return True
+
+    def reopen_user_assignments_from(self, user_id: str, day_key: str, slot_index: int, exclude: Optional[Tuple[str, str]] = None) -> int:
+        reopened = 0
+        seen: set[Tuple[str, str]] = set()
+        for row in self.assignments if isinstance(self.assignments, list) else []:
+            if row.get("user_id") != user_id:
+                continue
+            row_day = str(row.get("date", ""))
+            row_slot = int(row.get("slot_index", 0))
+            if row_day < day_key or (row_day == day_key and row_slot < slot_index):
+                continue
+            task_ref = (str(row.get("project_id", "")), str(row.get("task_id", "")))
+            if exclude and task_ref == exclude:
+                continue
+            if task_ref in seen:
+                continue
+            task = self.find_task(task_ref[0], task_ref[1])
+            if task and task.get("status") != "termine":
+                task["status"] = "a_planifier"
+                task["manual_start"] = {"date": row_day, "slot_index": row_slot, "user_id": user_id}
+                seen.add(task_ref)
+                reopened += 1
+        return reopened
 
     @staticmethod
     def _schedule_sort_key(item: Dict[str, Any]) -> Tuple[Any, ...]:
@@ -564,6 +620,7 @@ class PlannerApp:
         self.dashboard_mode_var = tk.StringVar(value="Jour")
         self.selected_project_id: Optional[str] = None
         self.selected_slot: Optional[Tuple[str, str, int]] = None
+        self.selected_task_ref: Optional[Tuple[str, str]] = None
         self.cut_task_ref: Optional[Dict[str, str]] = None
         self.dashboard_frame: Optional[ttk.Frame] = None
         self.dashboard_canvas: Optional[tk.Canvas] = None
@@ -586,7 +643,7 @@ class PlannerApp:
         ttk.Entry(top, textvariable=self.start_var, width=12).grid(row=0, column=1, padx=3)
         ttk.Label(top, text="Semaines").grid(row=0, column=2, padx=(10, 4))
         ttk.Spinbox(top, from_=1, to=52, textvariable=self.weeks_var, width=5).grid(row=0, column=3, padx=3)
-        ttk.Button(top, text="Recalculer planning", command=self.recalculate_schedule).grid(row=0, column=4, padx=8)
+        ttk.Button(top, text="Planifier les taches a_planifier", command=self.recalculate_schedule).grid(row=0, column=4, padx=8)
         ttk.Button(top, text="Sauver", command=self.save_all).grid(row=0, column=5, padx=3)
         ttk.Button(top, text="Backup", command=self.backup).grid(row=0, column=6, padx=3)
 
@@ -615,6 +672,8 @@ class PlannerApp:
         self._build_users_tab()
         self._build_projects_tab()
         self._build_settings_tab()
+        self.root.bind("<Control-x>", lambda _event: self.cut_selected_slot())
+        self.root.bind("<Control-v>", lambda _event: self.paste_to_selected_slot())
 
         ttk.Label(self.root, textvariable=self.status_var, anchor="w").grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 6))
 
@@ -639,6 +698,7 @@ class PlannerApp:
         ttk.Button(toolbar, text="Marquer tache terminee", command=self.mark_selected_task_done).pack(side=tk.LEFT, padx=3)
         ttk.Button(toolbar, text="Mettre en urgent", command=self.mark_selected_task_urgent).pack(side=tk.LEFT, padx=3)
         ttk.Button(toolbar, text="Aller a la tache", command=self.focus_selected_task).pack(side=tk.LEFT, padx=3)
+        ttk.Label(toolbar, text="Selection case -> Ctrl+X / Ctrl+V, rouge = absence").pack(side=tk.LEFT, padx=12)
 
         dashboard_outer = ttk.Frame(self.tab_planning)
         dashboard_outer.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
@@ -676,6 +736,7 @@ class PlannerApp:
         sb = ttk.Scrollbar(self.tab_planning, orient=tk.VERTICAL, command=self.schedule_tree.yview)
         sb.grid(row=3, column=1, sticky="ns", pady=(0, 8))
         self.schedule_tree.configure(yscrollcommand=sb.set)
+        self.schedule_tree.bind("<<TreeviewSelect>>", lambda _event: self.select_assignment_from_tree())
 
         self.summary_var = tk.StringVar()
         ttk.Label(self.tab_planning, textvariable=self.summary_var, anchor="w").grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 8))
@@ -839,6 +900,8 @@ class PlannerApp:
                     key = (day.isoformat(), user["id"], slot)
                     row_data = assignment_index.get(key)
                     text, bg, fg = self.dashboard_cell_style(user, day, slot, row_data)
+                    if row_data and self.selected_task_ref == (row_data.get("project_id"), row_data.get("task_id")):
+                        bg = SELECTED_COLOR
                     if self.selected_slot == (user["id"], day.isoformat(), slot):
                         bg = SELECTED_COLOR
                     button = tk.Button(
@@ -905,13 +968,26 @@ class PlannerApp:
         user_name = self.store.user_name(user_id) or user_id
         assignment = self.assignment_at_slot(user_id, day_key, slot_index)
         if assignment:
+            self.selected_task_ref = (assignment["project_id"], assignment["task_id"])
             self.set_status(f"Selection: {user_name} {day_key} {slot_label(slot_index)} - {assignment['project_name']} / {assignment['task_name']}")
             if assignment["id"] in self.schedule_tree.get_children(""):
                 self.schedule_tree.selection_set(assignment["id"])
                 self.schedule_tree.focus(assignment["id"])
         else:
+            self.selected_task_ref = None
             self.set_status(f"Selection: {user_name} {day_key} {slot_label(slot_index)}")
             self.schedule_tree.selection_remove(self.schedule_tree.selection())
+        self.refresh_dashboard()
+
+    def select_assignment_from_tree(self) -> None:
+        selection = self.schedule_tree.selection()
+        if not selection:
+            return
+        assignment = next((row for row in self.store.assignments if row.get("id") == selection[0]), None)
+        if not assignment:
+            return
+        self.selected_task_ref = (assignment["project_id"], assignment["task_id"])
+        self.selected_slot = (assignment["user_id"], assignment["date"], int(assignment.get("slot_index", 0)))
         self.refresh_dashboard()
 
     def assignment_at_slot(self, user_id: str, day_key: str, slot_index: int) -> Optional[Dict[str, Any]]:
@@ -950,6 +1026,7 @@ class PlannerApp:
             messagebox.showerror("Coller", "La tache coupee n'existe plus.")
             self.cut_task_ref = None
             return
+        self.store.reopen_user_assignments_from(user_id, day_key, slot_index, exclude=(self.cut_task_ref["project_id"], self.cut_task_ref["task_id"]))
         task["manual_start"] = {"date": day_key, "slot_index": slot_index, "user_id": user_id}
         task["assignee_id"] = user_id
         task["status"] = "a_planifier"
@@ -984,6 +1061,7 @@ class PlannerApp:
         def save() -> None:
             duration = clamp_int(duration_var.get(), 1, SLOTS_PER_DAY - slot_index, 1)
             self.store.add_block(user_id, day, slot_index, duration, note_var.get().strip())
+            self.store.reopen_user_assignments_from(user_id, day_key, slot_index)
             self.after_data_change("Absence ajoutee et planning decale")
             dialog.destroy()
 
@@ -1063,7 +1141,7 @@ class PlannerApp:
             details = "\n".join(f"- {row['project_name']} / {row['task_name']}: {row['reason']}" for row in result.unscheduled[:12])
             more = "" if len(result.unscheduled) <= 12 else f"\n... et {len(result.unscheduled) - 12} autre(s)"
             messagebox.showwarning("Taches non planifiees", details + more)
-        self.set_status(f"Planning recalcule: {len(result.assignments)} segment(s), {len(result.unscheduled)} non planifiee(s)")
+        self.set_status(f"Planification terminee: {len(result.assignments)} segment(s) au total, {len(result.unscheduled)} tache(s) non placee(s)")
 
     def backup(self) -> None:
         target = self.store.backup()

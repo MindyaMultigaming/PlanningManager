@@ -35,8 +35,10 @@ Fichiers crees automatiquement:
 - La vue `Jour` affiche une journee; la vue `Semaine` affiche les 5 jours ouvrables.
 - Les absences completes ou par creneau sont visibles en rouge.
 - Les creneaux non travailles a cause d'une capacite reduite sont grises.
-- Depuis une case du dashboard, on peut couper une tache puis la coller sur une autre case: elle est forcee a ce nouveau depart et le reste est recalcule.
+- Selectionner une case met en evidence tous les creneaux de la tache concernee.
+- Depuis une case du dashboard, on peut couper une tache puis la coller sur une autre case avec les boutons ou `Ctrl+X` / `Ctrl+V`: elle est forcee a ce nouveau depart et le reste est decale.
 - Depuis une case du dashboard, on peut ajouter une absence sur un ou plusieurs creneaux: les taches presentes sont decalees au recalcul.
+- Le bouton de planification ajoute uniquement les taches au statut `a_planifier`, puis les passe au statut `planifie`.
 
 ## Generer un exe
 
